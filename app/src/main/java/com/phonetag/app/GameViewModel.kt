@@ -1,0 +1,371 @@
+package com.phonetag.app
+
+import android.app.Application
+import android.content.Context
+import android.media.AudioManager
+import android.media.ToneGenerator
+import android.os.Build
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import com.phonetag.app.net.GroupInfo
+import com.phonetag.app.net.NearbyGame
+import com.phonetag.app.net.WifiDirect
+import com.phonetag.app.sensors.Aim
+import com.phonetag.app.sensors.LocationTracker
+import com.phonetag.app.sensors.OrientationTracker
+import com.phonetag.core.ClientMessage
+import com.phonetag.core.GameClient
+import com.phonetag.core.GameServer
+import com.phonetag.core.GameSettings
+import com.phonetag.core.LobbySummary
+import com.phonetag.core.Phase
+import com.phonetag.core.Pose
+import com.phonetag.core.Protocol
+import com.phonetag.core.ServerMessage
+import com.phonetag.core.Team
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+enum class Screen { HOME, NEARBY, ONLINE, CONNECTING, SESSION }
+
+enum class Transport { WIFI_DIRECT_HOST, WIFI_DIRECT_JOIN, ONLINE }
+
+data class FeedItem(val text: String, val atMs: Long)
+
+data class UiState(
+    val screen: Screen = Screen.HOME,
+    val playerName: String = "",
+    val serverAddress: String = "",
+    val status: String? = null,
+    val error: String? = null,
+    val transport: Transport? = null,
+    val myId: Int = 0,
+    val lobby: ServerMessage.LobbyState? = null,
+    val snapshot: ServerMessage.Snapshot? = null,
+    val results: ServerMessage.MatchEnded? = null,
+    val onlineLobbies: List<LobbySummary> = emptyList(),
+    val feed: List<FeedItem> = emptyList(),
+    /** Incremented on every hit taken / hit dealt so the UI can flash. */
+    val hitTakenCount: Int = 0,
+    val hitDealtCount: Int = 0,
+    val lastShotMiss: Boolean = false,
+) {
+    val me get() = snapshot?.players?.firstOrNull { it.id == myId }
+    val isHost get() = lobby?.hostId == myId
+    fun nameOf(id: Int) = lobby?.players?.firstOrNull { it.id == id }?.name ?: "#$id"
+    fun teamOf(id: Int) = lobby?.players?.firstOrNull { it.id == id }?.team ?: Team.NONE
+}
+
+/**
+ * Owns the whole session: Wi-Fi Direct group, the optional local [GameServer] (when this
+ * phone hosts), the [GameClient] connection and the sensors feeding our pose to the server.
+ */
+class GameViewModel(app: Application) : AndroidViewModel(app) {
+    private val prefs = app.getSharedPreferences("phonetag", Context.MODE_PRIVATE)
+
+    private val _state = MutableStateFlow(
+        UiState(
+            playerName = prefs.getString("name", null) ?: Build.MODEL.take(16),
+            serverAddress = prefs.getString("server", "") ?: "",
+        )
+    )
+    val state: StateFlow<UiState> = _state.asStateFlow()
+
+    val wifiDirect = WifiDirect(app)
+    val nearbyGames: StateFlow<List<NearbyGame>> = wifiDirect.nearby
+    val groupInfo: StateFlow<GroupInfo?> = wifiDirect.groupInfo
+
+    private val orientation = OrientationTracker(app)
+    private val locations = LocationTracker(app)
+    val aim: StateFlow<Aim> = orientation.aim
+    val location = locations.location
+
+    private var localServer: GameServer? = null
+    private var client: GameClient? = null
+    private var poseJob: Job? = null
+    private var shotSeq = 0
+    private var lastShotAtMs = 0L
+    @Volatile private var leaving = false
+
+    private val tones = runCatching { ToneGenerator(AudioManager.STREAM_MUSIC, 70) }.getOrNull()
+    private val vibrator: Vibrator? = if (Build.VERSION.SDK_INT >= 31) {
+        app.getSystemService(VibratorManager::class.java)?.defaultVibrator
+    } else {
+        @Suppress("DEPRECATION")
+        app.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+    }
+
+    // ------------------------------------------------------------------ sensors (permission-gated)
+
+    fun onPermissionsGranted() {
+        locations.start()
+        orientation.start()
+        viewModelScope.launch {
+            locations.location.collect { loc -> loc?.let(orientation::updateDeclination) }
+        }
+    }
+
+    fun currentPose(): Pose? {
+        val loc = locations.location.value ?: return null
+        val a = orientation.aim.value
+        return Pose(loc.latitude, loc.longitude, loc.accuracy.toDouble().coerceAtLeast(1.0), a.azimuthDeg, a.pitchDeg)
+    }
+
+    // ------------------------------------------------------------------ navigation
+
+    fun setName(name: String) {
+        _state.update { it.copy(playerName = name.take(20)) }
+        prefs.edit().putString("name", name.take(20)).apply()
+    }
+
+    fun setServerAddress(address: String) {
+        _state.update { it.copy(serverAddress = address.trim()) }
+        prefs.edit().putString("server", address.trim()).apply()
+    }
+
+    fun dismissError() = _state.update { it.copy(error = null) }
+
+    fun openNearby() {
+        _state.update { it.copy(screen = Screen.NEARBY, error = null) }
+        wifiDirect.startDiscovery()
+    }
+
+    fun refreshNearby() = wifiDirect.startDiscovery()
+
+    fun openOnline() {
+        _state.update { it.copy(screen = Screen.ONLINE, error = null, onlineLobbies = emptyList()) }
+    }
+
+    fun back() {
+        when (_state.value.screen) {
+            Screen.NEARBY -> wifiDirect.stopDiscovery()
+            Screen.SESSION, Screen.CONNECTING -> return leave()
+            else -> Unit
+        }
+        _state.update { it.copy(screen = Screen.HOME) }
+    }
+
+    // ------------------------------------------------------------------ Wi-Fi Direct
+
+    /** This phone becomes the Wi-Fi Direct group owner and runs the authoritative server. */
+    fun hostNearby() {
+        val name = _state.value.playerName
+        connecting(Transport.WIFI_DIRECT_HOST, "Creating Wi-Fi Direct group…")
+        wifiDirect.host(
+            lobbyName = "$name's game",
+            onReady = {
+                viewModelScope.launch {
+                    val ok = withContext(Dispatchers.IO) {
+                        runCatching {
+                            localServer?.stop()
+                            localServer = GameServer(port = Protocol.DEFAULT_PORT, singleLobby = true).also { it.start() }
+                        }
+                    }
+                    ok.onFailure { return@launch fail("Could not start game server: ${it.message}") }
+                    connectTo("127.0.0.1", Protocol.DEFAULT_PORT, ClientMessage.Hello(Protocol.VERSION, name, create = true, lobbyName = "$name's game"))
+                }
+            },
+            onError = ::fail,
+        )
+    }
+
+    fun joinNearby(game: NearbyGame) {
+        wifiDirect.stopDiscovery()
+        connecting(Transport.WIFI_DIRECT_JOIN, "Connecting to ${game.lobbyName ?: game.deviceName}… (the host may need to accept)")
+        wifiDirect.join(
+            game,
+            onConnected = { ownerIp ->
+                _state.update { it.copy(status = "Joined Wi-Fi Direct group, opening game connection…") }
+                connectTo(ownerIp, Protocol.DEFAULT_PORT, ClientMessage.Hello(Protocol.VERSION, _state.value.playerName), retries = 8)
+            },
+            onError = ::fail,
+        )
+    }
+
+    // ------------------------------------------------------------------ dedicated server
+
+    fun createOnline() = online(ClientMessage.Hello(Protocol.VERSION, _state.value.playerName, create = true, lobbyName = "${_state.value.playerName}'s game"))
+
+    fun joinOnline(code: String) = online(ClientMessage.Hello(Protocol.VERSION, _state.value.playerName, lobbyCode = code.trim().uppercase()))
+
+    fun refreshOnlineLobbies() {
+        val (host, port) = parseAddress(_state.value.serverAddress) ?: return fail("Enter a server address like play.example.com:47474")
+        viewModelScope.launch(Dispatchers.IO) {
+            val probe = GameClient(
+                onMessage = { msg -> if (msg is ServerMessage.LobbyList) _state.update { it.copy(onlineLobbies = msg.lobbies) } },
+                onDisconnected = {},
+            )
+            runCatching {
+                probe.connect(host, port)
+                probe.send(ClientMessage.ListLobbies)
+                delay(1500)
+            }.onFailure { e -> _state.update { it.copy(error = "Server unreachable: ${e.message}") } }
+            probe.disconnect()
+        }
+    }
+
+    private fun online(hello: ClientMessage.Hello) {
+        val (host, port) = parseAddress(_state.value.serverAddress) ?: return fail("Enter a server address like play.example.com:47474")
+        connecting(Transport.ONLINE, "Connecting to $host:$port…")
+        connectTo(host, port, hello)
+    }
+
+    private fun parseAddress(raw: String): Pair<String, Int>? {
+        if (raw.isBlank()) return null
+        val idx = raw.lastIndexOf(':')
+        return if (idx > 0 && !raw.substring(0, idx).contains(':')) {
+            raw.substring(0, idx) to (raw.substring(idx + 1).toIntOrNull() ?: return null)
+        } else {
+            raw to Protocol.DEFAULT_PORT
+        }
+    }
+
+    // ------------------------------------------------------------------ session
+
+    private fun connecting(transport: Transport, status: String) {
+        leaving = false
+        _state.update {
+            it.copy(screen = Screen.CONNECTING, transport = transport, status = status, error = null,
+                lobby = null, snapshot = null, results = null, feed = emptyList(), myId = 0)
+        }
+    }
+
+    private fun connectTo(host: String, port: Int, hello: ClientMessage.Hello, retries: Int = 1) {
+        viewModelScope.launch {
+            val c = GameClient(onMessage = ::onServerMessage, onDisconnected = ::onDisconnected)
+            var lastError: Throwable? = null
+            for (attempt in 1..retries) {
+                if (leaving) return@launch
+                val r = withContext(Dispatchers.IO) { runCatching { c.connect(host, port) } }
+                if (r.isSuccess) {
+                    client = c
+                    c.send(hello)
+                    startPoseLoop()
+                    return@launch
+                }
+                lastError = r.exceptionOrNull()
+                delay(1000) // the group owner's IP / server may need a moment
+            }
+            fail("Could not reach game at $host:$port (${lastError?.message})")
+        }
+    }
+
+    private fun startPoseLoop() {
+        poseJob?.cancel()
+        poseJob = viewModelScope.launch {
+            var tick = 0
+            while (isActive) {
+                val c = client ?: break
+                currentPose()?.let { c.send(ClientMessage.PoseUpdate(it)) }
+                if (tick++ % 25 == 0) c.send(ClientMessage.Ping(System.currentTimeMillis()))
+                delay(200)
+            }
+        }
+    }
+
+    private fun onServerMessage(msg: ServerMessage) {
+        val now = System.currentTimeMillis()
+        when (msg) {
+            is ServerMessage.Welcome -> _state.update { it.copy(myId = msg.playerId, screen = Screen.SESSION, status = null) }
+            is ServerMessage.LobbyState -> _state.update { s ->
+                val starting = s.lobby?.phase != Phase.RUNNING && msg.phase == Phase.RUNNING
+                s.copy(
+                    lobby = msg,
+                    results = if (starting) null else s.results,
+                    feed = if (starting) emptyList() else s.feed,
+                    snapshot = if (starting) null else s.snapshot,
+                )
+            }
+            is ServerMessage.Snapshot -> _state.update { it.copy(snapshot = msg) }
+            is ServerMessage.ShotResult -> {
+                if (msg.hitPlayerId != null) {
+                    tones?.startTone(ToneGenerator.TONE_PROP_ACK, 120)
+                    _state.update { it.copy(hitDealtCount = it.hitDealtCount + 1, lastShotMiss = false) }
+                } else {
+                    _state.update { it.copy(lastShotMiss = true) }
+                }
+            }
+            is ServerMessage.HitBy -> {
+                vibrate(if (msg.eliminated) 600 else 150)
+                _state.update { it.copy(hitTakenCount = it.hitTakenCount + 1) }
+            }
+            is ServerMessage.Tagged -> _state.update { s ->
+                val text = "${s.nameOf(msg.shooterId)} tagged ${s.nameOf(msg.victimId)}"
+                s.copy(feed = (s.feed + FeedItem(text, now)).takeLast(5))
+            }
+            is ServerMessage.MatchEnded -> _state.update { it.copy(results = msg) }
+            is ServerMessage.Error -> viewModelScope.launch {
+                if (_state.value.myId == 0) fail(msg.message) else _state.update { it.copy(error = msg.message) }
+            }
+            is ServerMessage.LobbyList -> _state.update { it.copy(onlineLobbies = msg.lobbies) }
+            is ServerMessage.Pong -> Unit
+        }
+    }
+
+    private fun onDisconnected() {
+        if (leaving) return
+        viewModelScope.launch { fail("Connection to the game was lost") }
+    }
+
+    // ------------------------------------------------------------------ actions
+
+    fun fire() {
+        val now = System.currentTimeMillis()
+        val s = _state.value
+        val cooldown = s.lobby?.settings?.fireCooldownMs ?: 350
+        if (now - lastShotAtMs < cooldown || s.me?.alive == false) return
+        val pose = currentPose() ?: return _state.update { it.copy(error = "Waiting for GPS fix…") }
+        lastShotAtMs = now
+        tones?.startTone(ToneGenerator.TONE_PROP_BEEP, 60)
+        client?.send(ClientMessage.Shoot(++shotSeq, pose))
+    }
+
+    fun setTeam(team: Team) = client?.send(ClientMessage.SetTeam(team))
+    fun updateSettings(settings: GameSettings) = client?.send(ClientMessage.UpdateSettings(settings))
+    fun startMatch() = client?.send(ClientMessage.StartMatch)
+    fun backToLobby() = client?.send(ClientMessage.BackToLobby)
+
+    fun leave() {
+        leaving = true
+        poseJob?.cancel()
+        val c = client
+        val server = localServer
+        client = null
+        localServer = null
+        // Plain thread: this also runs from onCleared(), when viewModelScope is already cancelled.
+        Thread {
+            c?.disconnect()
+            server?.stop()
+        }.start()
+        if (_state.value.transport != Transport.ONLINE) wifiDirect.leave()
+        _state.update { UiState(playerName = it.playerName, serverAddress = it.serverAddress, error = it.error) }
+    }
+
+    private fun fail(message: String) {
+        leave()
+        _state.update { it.copy(error = message) }
+    }
+
+    private fun vibrate(ms: Long) {
+        vibrator?.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE))
+    }
+
+    override fun onCleared() {
+        leave()
+        wifiDirect.close()
+        locations.stop()
+        orientation.stop()
+        tones?.release()
+    }
+}
