@@ -38,6 +38,22 @@ newline-delimited JSON protocol over TCP. The host phone just runs the server in
   350 ms fire cooldown, 60 m range by default. The server enforces all of them. Free-for-all
   or Red vs Blue teams (no friendly fire). Matches last 5, 10 or 15 min.
 
+### AR view & sound
+- **Player markers in the camera image.** Each player's GPS bearing is projected into the viewfinder
+  using the real camera's field of view (read from the lens focal length and sensor size).
+  Each marker shows a name, distance and health bar. Enemies are diamonds, teammates are
+  chevrons, and tagged-out players are grey X's. Players outside the view appear as stacked
+  arrows on the screen edge. Markers are smoothed so GPS jitter doesn't make them jump.
+- **Effects:** laser beam and muzzle flash on fire, spinning lock-on brackets, a hit marker
+  with sparks, a shockwave and a "+1 TAG" banner on tag-outs, a red damage vignette with
+  screen shake and an arrow pointing at whoever shot you, a heartbeat vignette at low health,
+  a blue spawn-shield glow, a "signal lost" glitch while tagged out, and a radar sweep.
+  See `app/.../ui/ArOverlay.kt`.
+- **Sound effects** are synthesized in code (`app/.../sfx/Synth.kt`), so the app ships no audio
+  files. They're rendered to WAV once and played through `SoundPool`: laser, hit confirm,
+  tag, damage, tagged out, respawn, lock-on, match start/end and a low-health heartbeat.
+  You can mute them from the in-game HUD.
+
 ### Limitations to know about
 - **GPS is the precision limit.** Phone GPS is typically good to ±3–10 m outdoors and much
   worse indoors. Play outside with open sky, and spread out more than a few metres. The app

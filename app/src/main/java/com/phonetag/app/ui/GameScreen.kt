@@ -1,11 +1,14 @@
 package com.phonetag.app.ui
 
+import android.hardware.camera2.CameraCharacteristics
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -31,23 +34,31 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
-import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.phonetag.app.GameEvent
 import com.phonetag.app.GameViewModel
 import com.phonetag.app.UiState
 import com.phonetag.core.GameMode
@@ -55,7 +66,11 @@ import com.phonetag.core.Geo
 import com.phonetag.core.HitResolver
 import com.phonetag.core.Lobby
 import com.phonetag.core.Pose
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlin.math.atan
 import kotlin.math.cos
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
 
@@ -67,37 +82,71 @@ fun GameScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
     val me = state.me
     val myTeam = state.teamOf(state.myId)
     val teams = lobby.settings.mode == GameMode.TEAMS
+    val dead = me?.alive == false
+    val lowHealth = me != null && me.alive && me.health <= 25
 
-    val myPose = location?.let { Pose(it.latitude, it.longitude, it.accuracy.toDouble(), aim.azimuthDeg) }
-    val enemies = state.snapshot?.players.orEmpty().filter { p ->
-        p.id != state.myId && p.alive && p.pose != null && !(teams && state.teamOf(p.id) == myTeam)
-    }
-    // Client-side preview of the server's hit test: tells the player when someone is in the crosshair.
-    val lockedOn = myPose != null && HitResolver.resolve(
+    val myPose = location?.let { Pose(it.latitude, it.longitude, it.accuracy.toDouble(), aim.azimuthDeg, aim.pitchDeg) }
+    val others = state.snapshot?.players.orEmpty().filter { it.id != state.myId }
+    val enemies = others.filter { p -> p.alive && p.pose != null && !(teams && state.teamOf(p.id) == myTeam) }
+    // Client-side preview of the server's hit test: tells the player who is in the crosshair.
+    val lockedId = if (myPose == null || dead) null else HitResolver.resolve(
         myPose, enemies.map { HitResolver.Candidate(it.id, it.pose!!) }, lobby.settings.maxRangeM,
-    ) != null
+    )?.targetId
 
-    val hitFlash = remember { Animatable(0f) }
-    LaunchedEffect(state.hitTakenCount) {
-        if (state.hitTakenCount > 0) {
-            hitFlash.snapTo(0.55f)
-            hitFlash.animateTo(0f, tween(450))
+    val effects = remember { ArEffects() }
+    RunArFrameClock(effects)
+    var fov by remember { mutableStateOf(CameraFov()) }
+    val density = LocalDensity.current.density
+
+    // Turn game events into visual effects. The shooter's bearing feeds the damage-direction arrow.
+    val currentState by rememberUpdatedState(state)
+    val currentPose by rememberUpdatedState(myPose)
+    LaunchedEffect(Unit) {
+        vm.events.collect { e ->
+            val shooterBearing = (e as? GameEvent.HitTaken)?.let { hit ->
+                val from = currentPose ?: return@let null
+                val at = currentState.snapshot?.players?.firstOrNull { it.id == hit.shooterId }?.pose ?: return@let null
+                Geo.bearingDeg(from.lat, from.lon, at.lat, at.lon)
+            }
+            effects.onEvent(e, shooterBearing, density)
         }
     }
-    val dealtFlash = remember { Animatable(0f) }
-    LaunchedEffect(state.hitDealtCount) {
-        if (state.hitDealtCount > 0) {
-            dealtFlash.snapTo(1f)
-            dealtFlash.animateTo(0f, tween(400))
+    LaunchedEffect(lockedId) { if (lockedId != null) vm.onLockAcquired() }
+    LaunchedEffect(lowHealth) {
+        while (lowHealth) {
+            vm.playHeartbeat()
+            effects.onHeartbeat()
+            delay(1100)
         }
     }
 
-    Box(Modifier.fillMaxSize().background(Color.Black)) {
-        if (cameraGranted) CameraViewfinder(Modifier.fillMaxSize())
+    val laserColor = if (teams) myTeam.color() else Color(0xFFFF2D55)
 
-        Crosshair(locked = lockedOn, confirm = dealtFlash.value, modifier = Modifier.align(Alignment.Center).size(120.dp))
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+            // Screen shake when hit; only the layer is re-executed per frame.
+            .graphicsLayer {
+                val o = effects.shakeOffset(density)
+                translationX = o.x
+                translationY = o.y
+            },
+    ) {
+        if (cameraGranted) CameraViewfinder(Modifier.fillMaxSize(), onFov = { fov = it })
 
-        Box(Modifier.fillMaxSize().alpha(hitFlash.value).background(Color.Red))
+        ArOverlay(
+            effects = effects,
+            players = others.map { ArPlayer(it, state.nameOf(it.id), state.teamOf(it.id), teams && state.teamOf(it.id) == myTeam) },
+            myPose = myPose,
+            fov = fov,
+            maxRangeM = lobby.settings.maxRangeM,
+            lockedId = lockedId,
+            laserColor = laserColor,
+            lowHealth = lowHealth,
+            dead = dead,
+            modifier = Modifier.fillMaxSize(),
+        )
 
         Column(Modifier.fillMaxSize().safeDrawingPadding().padding(12.dp)) {
             // ---- top HUD
@@ -118,23 +167,17 @@ fun GameScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
                 }
             }
             Spacer(Modifier.height(6.dp))
-            Row {
-                Text(
-                    "${aim.azimuthDeg.toInt()}° ${compassPoint(aim.azimuthDeg)}",
-                    color = Color.White,
-                    modifier = Modifier.background(Color(0x66000000), RoundedCornerShape(6.dp)).padding(horizontal = 8.dp, vertical = 2.dp),
-                )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Chip("${aim.azimuthDeg.toInt()}° ${compassPoint(aim.azimuthDeg)}", Color.White)
                 Spacer(Modifier.width(8.dp))
                 val acc = location?.accuracy?.toInt()
-                Text(
-                    if (acc == null) "No GPS" else "GPS ±${acc} m",
-                    color = if (acc == null || acc > 10) Color(0xFFFFC107) else Color.White,
-                    modifier = Modifier.background(Color(0x66000000), RoundedCornerShape(6.dp)).padding(horizontal = 8.dp, vertical = 2.dp),
-                )
+                Chip(if (acc == null) "No GPS" else "GPS ±${acc} m", if (acc == null || acc > 10) Color(0xFFFFC107) else Color.White)
                 if (teams) {
                     Spacer(Modifier.width(8.dp))
                     Box(Modifier.size(20.dp).background(myTeam.color(), CircleShape))
                 }
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = vm::toggleSound) { Text(if (state.soundOn) "Sound on" else "Muted", color = Color.White) }
             }
             if (!aim.compassReliable) {
                 Text("Compass needs calibration: wave the phone in a figure 8", color = Color(0xFFFFC107), fontSize = 13.sp)
@@ -146,18 +189,18 @@ fun GameScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
 
             // ---- bottom HUD
             Row(verticalAlignment = Alignment.Bottom) {
-                Radar(state, myPose, lobby.settings.maxRangeM, Modifier.size(170.dp))
+                Radar(state, myPose, lobby.settings.maxRangeM, effects, Modifier.size(170.dp))
                 Spacer(Modifier.weight(1f))
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    FireButton(enabled = me?.alive != false && location != null, onFire = vm::fire)
+                    FireButton(enabled = !dead && location != null, color = laserColor, onFire = vm::fire)
                     TextButton(onClick = vm::leave) { Text("Quit", color = Color.White) }
                 }
             }
         }
 
-        if (me != null && !me.alive) {
+        if (me != null && dead) {
             Column(
-                Modifier.fillMaxSize().background(Color(0xCC000000)),
+                Modifier.fillMaxSize().background(Color(0x99000000)),
                 verticalArrangement = Arrangement.Center,
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
@@ -168,42 +211,41 @@ fun GameScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
     }
 }
 
+@Composable
+private fun Chip(text: String, color: Color) = Text(
+    text,
+    color = color,
+    modifier = Modifier.background(Color(0x66000000), RoundedCornerShape(6.dp)).padding(horizontal = 8.dp, vertical = 2.dp),
+)
+
 private fun compassPoint(deg: Double) = listOf("N", "NE", "E", "SE", "S", "SW", "W", "NW")[(((deg + 22.5) % 360) / 45).toInt()]
 
 @Composable
-private fun Crosshair(locked: Boolean, confirm: Float, modifier: Modifier) {
-    val color = if (locked) RedTeam else Color.White
-    Canvas(modifier) {
-        val c = center
-        val r = size.minDimension / 2 * 0.6f
-        val stroke = 3.dp.toPx()
-        drawCircle(color, r, c, style = Stroke(stroke))
-        val gap = r * 0.35f
-        val len = r * 0.9f
-        drawLine(color, Offset(c.x, c.y - gap), Offset(c.x, c.y - len - gap), stroke, StrokeCap.Round)
-        drawLine(color, Offset(c.x, c.y + gap), Offset(c.x, c.y + len + gap), stroke, StrokeCap.Round)
-        drawLine(color, Offset(c.x - gap, c.y), Offset(c.x - len - gap, c.y), stroke, StrokeCap.Round)
-        drawLine(color, Offset(c.x + gap, c.y), Offset(c.x + len + gap, c.y), stroke, StrokeCap.Round)
-        drawCircle(color, 3.dp.toPx(), c)
-        if (confirm > 0f) {
-            // Hit marker: an X that fades out.
-            val k = r * 0.5f
-            val hc = Color.White.copy(alpha = confirm)
-            drawLine(hc, Offset(c.x - k, c.y - k), Offset(c.x + k, c.y + k), stroke * 1.5f, StrokeCap.Round)
-            drawLine(hc, Offset(c.x - k, c.y + k), Offset(c.x + k, c.y - k), stroke * 1.5f, StrokeCap.Round)
-        }
-    }
-}
-
-@Composable
-private fun FireButton(enabled: Boolean, onFire: () -> Unit) {
+private fun FireButton(enabled: Boolean, color: Color, onFire: () -> Unit) {
+    val press = remember { Animatable(1f) }
+    val scope = rememberCoroutineScope()
     Box(
         Modifier
             .size(110.dp)
-            .background(if (enabled) RedTeam else Color.DarkGray, CircleShape)
+            .graphicsLayer { scaleX = press.value; scaleY = press.value }
+            .background(
+                if (enabled) Brush.radialGradient(listOf(Color.White.copy(alpha = 0.5f), color, color.copy(alpha = 0.8f)))
+                else Brush.linearGradient(listOf(Color.DarkGray, Color.DarkGray)),
+                CircleShape,
+            )
             .border(4.dp, Color.White.copy(alpha = 0.7f), CircleShape)
             // onPress instead of onTap so shots fire on touch-down without waiting for release.
-            .pointerInput(enabled) { detectTapGestures(onPress = { if (enabled) onFire() }) },
+            .pointerInput(enabled) {
+                detectTapGestures(onPress = {
+                    if (enabled) {
+                        onFire()
+                        scope.launch {
+                            press.snapTo(0.86f)
+                            press.animateTo(1f, spring(dampingRatio = 0.35f, stiffness = 900f))
+                        }
+                    }
+                })
+            },
         contentAlignment = Alignment.Center,
     ) {
         Text("FIRE", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Black)
@@ -215,7 +257,7 @@ private fun FireButton(enabled: Boolean, onFire: () -> Unit) {
  * the weapon's max range. Players use their team colour (red in free-for-all), tagged-out players grey.
  */
 @Composable
-private fun Radar(state: UiState, myPose: Pose?, rangeM: Double, modifier: Modifier) {
+private fun Radar(state: UiState, myPose: Pose?, rangeM: Double, effects: ArEffects, modifier: Modifier) {
     val players = state.snapshot?.players.orEmpty()
     val teams = state.lobby?.settings?.mode == GameMode.TEAMS
     Canvas(modifier.background(Color(0x99000000), CircleShape)) {
@@ -223,7 +265,16 @@ private fun Radar(state: UiState, myPose: Pose?, rangeM: Double, modifier: Modif
         val r = size.minDimension / 2
         drawCircle(Color(0x5539FF14), r, c, style = Stroke(1.dp.toPx()))
         drawCircle(Color(0x3339FF14), r / 2, c, style = Stroke(1.dp.toPx()))
-        // Field of fire wedge.
+        // Rotating sweep with a fading trail.
+        val sweep = (effects.t * 120 % 360).toFloat()
+        rotate(sweep, c) {
+            drawArc(
+                Brush.sweepGradient(0.88f to Color.Transparent, 1f to Color(0x6639FF14), center = c),
+                startAngle = 0f, sweepAngle = 360f, useCenter = true,
+                topLeft = Offset(c.x - r, c.y - r), size = Size(2 * r, 2 * r),
+            )
+        }
+        // Line of fire.
         drawLine(Color(0x5539FF14), c, Offset(c.x, c.y - r), 1.dp.toPx())
         drawCircle(Color.White, 4.dp.toPx(), c)
         if (myPose == null) return@Canvas
@@ -244,8 +295,9 @@ private fun Radar(state: UiState, myPose: Pose?, rangeM: Double, modifier: Modif
     }
 }
 
+@androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
 @Composable
-private fun CameraViewfinder(modifier: Modifier) {
+private fun CameraViewfinder(modifier: Modifier, onFov: (CameraFov) -> Unit) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val previewView = remember { PreviewView(context).apply { scaleType = PreviewView.ScaleType.FILL_CENTER } }
@@ -256,10 +308,21 @@ private fun CameraViewfinder(modifier: Modifier) {
             val preview = Preview.Builder().build().also { it.surfaceProvider = previewView.surfaceProvider }
             runCatching {
                 provider.unbindAll()
-                provider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview)
+                val camera = provider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview)
+                cameraFov(Camera2CameraInfo.from(camera.cameraInfo))?.let(onFov)
             }
         }, ContextCompat.getMainExecutor(context))
         onDispose { runCatching { future.get().unbindAll() } }
     }
     AndroidView(factory = { previewView }, modifier = modifier)
+}
+
+/** Field of view from the lens focal length and sensor size, so AR markers line up with the image. */
+@androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
+private fun cameraFov(info: Camera2CameraInfo): CameraFov? {
+    val sensor = info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE) ?: return null
+    val focal = info.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.minOrNull() ?: return null
+    if (focal <= 0f) return null
+    fun fov(side: Float) = Math.toDegrees(2 * atan(side / (2.0 * focal)))
+    return CameraFov(longDeg = fov(max(sensor.width, sensor.height)), shortDeg = fov(min(sensor.width, sensor.height)))
 }

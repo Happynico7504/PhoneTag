@@ -2,8 +2,6 @@ package com.phonetag.app
 
 import android.app.Application
 import android.content.Context
-import android.media.AudioManager
-import android.media.ToneGenerator
 import android.os.Build
 import android.os.VibrationEffect
 import android.os.Vibrator
@@ -16,6 +14,8 @@ import com.phonetag.app.net.WifiDirect
 import com.phonetag.app.sensors.Aim
 import com.phonetag.app.sensors.LocationTracker
 import com.phonetag.app.sensors.OrientationTracker
+import com.phonetag.app.sfx.Sfx
+import com.phonetag.app.sfx.SoundFx
 import com.phonetag.core.ClientMessage
 import com.phonetag.core.GameClient
 import com.phonetag.core.GameServer
@@ -29,7 +29,10 @@ import com.phonetag.core.Team
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
@@ -42,6 +45,15 @@ enum class Screen { HOME, NEARBY, ONLINE, CONNECTING, SESSION }
 enum class Transport { WIFI_DIRECT_HOST, WIFI_DIRECT_JOIN, ONLINE }
 
 data class FeedItem(val text: String, val atMs: Long)
+
+/** One-shot moments the AR view turns into visual effects (beams, sparks, damage indicators…). */
+sealed interface GameEvent {
+    data object Fired : GameEvent
+    data class HitDealt(val victimId: Int, val eliminated: Boolean) : GameEvent
+    data class HitTaken(val shooterId: Int, val eliminated: Boolean) : GameEvent
+    data object Respawned : GameEvent
+    data object MatchStarted : GameEvent
+}
 
 data class UiState(
     val screen: Screen = Screen.HOME,
@@ -56,10 +68,7 @@ data class UiState(
     val results: ServerMessage.MatchEnded? = null,
     val onlineLobbies: List<LobbySummary> = emptyList(),
     val feed: List<FeedItem> = emptyList(),
-    /** Incremented on every hit taken / hit dealt so the UI can flash. */
-    val hitTakenCount: Int = 0,
-    val hitDealtCount: Int = 0,
-    val lastShotMiss: Boolean = false,
+    val soundOn: Boolean = true,
 ) {
     val me get() = snapshot?.players?.firstOrNull { it.id == myId }
     val isHost get() = lobby?.hostId == myId
@@ -78,6 +87,7 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
         UiState(
             playerName = prefs.getString("name", null) ?: Build.MODEL.take(16),
             serverAddress = prefs.getString("server", "") ?: "",
+            soundOn = prefs.getBoolean("sound", true),
         )
     )
     val state: StateFlow<UiState> = _state.asStateFlow()
@@ -98,7 +108,9 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
     private var lastShotAtMs = 0L
     @Volatile private var leaving = false
 
-    private val tones = runCatching { ToneGenerator(AudioManager.STREAM_MUSIC, 70) }.getOrNull()
+    private val sfx = SoundFx(app).also { it.enabled = _state.value.soundOn }
+    private val _events = MutableSharedFlow<GameEvent>(extraBufferCapacity = 32)
+    val events: SharedFlow<GameEvent> = _events.asSharedFlow()
     private val vibrator: Vibrator? = if (Build.VERSION.SDK_INT >= 31) {
         app.getSystemService(VibratorManager::class.java)?.defaultVibrator
     } else {
@@ -278,33 +290,46 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
         val now = System.currentTimeMillis()
         when (msg) {
             is ServerMessage.Welcome -> _state.update { it.copy(myId = msg.playerId, screen = Screen.SESSION, status = null) }
-            is ServerMessage.LobbyState -> _state.update { s ->
-                val starting = s.lobby?.phase != Phase.RUNNING && msg.phase == Phase.RUNNING
-                s.copy(
-                    lobby = msg,
-                    results = if (starting) null else s.results,
-                    feed = if (starting) emptyList() else s.feed,
-                    snapshot = if (starting) null else s.snapshot,
-                )
-            }
-            is ServerMessage.Snapshot -> _state.update { it.copy(snapshot = msg) }
-            is ServerMessage.ShotResult -> {
-                if (msg.hitPlayerId != null) {
-                    tones?.startTone(ToneGenerator.TONE_PROP_ACK, 120)
-                    _state.update { it.copy(hitDealtCount = it.hitDealtCount + 1, lastShotMiss = false) }
-                } else {
-                    _state.update { it.copy(lastShotMiss = true) }
+            is ServerMessage.LobbyState -> {
+                val starting = _state.value.lobby?.phase != Phase.RUNNING && msg.phase == Phase.RUNNING
+                _state.update { s ->
+                    s.copy(
+                        lobby = msg,
+                        results = if (starting) null else s.results,
+                        feed = if (starting) emptyList() else s.feed,
+                        snapshot = if (starting) null else s.snapshot,
+                    )
                 }
+                if (starting) {
+                    sfx.play(Sfx.MATCH_START)
+                    _events.tryEmit(GameEvent.MatchStarted)
+                }
+            }
+            is ServerMessage.Snapshot -> {
+                val wasDead = _state.value.me?.alive == false
+                _state.update { it.copy(snapshot = msg) }
+                if (wasDead && _state.value.me?.alive == true) {
+                    sfx.play(Sfx.RESPAWN)
+                    _events.tryEmit(GameEvent.Respawned)
+                }
+            }
+            is ServerMessage.ShotResult -> msg.hitPlayerId?.let { victim ->
+                sfx.play(if (msg.eliminated) Sfx.TAG else Sfx.HIT_CONFIRM)
+                _events.tryEmit(GameEvent.HitDealt(victim, msg.eliminated))
             }
             is ServerMessage.HitBy -> {
                 vibrate(if (msg.eliminated) 600 else 150)
-                _state.update { it.copy(hitTakenCount = it.hitTakenCount + 1) }
+                sfx.play(if (msg.eliminated) Sfx.TAGGED_OUT else Sfx.DAMAGE)
+                _events.tryEmit(GameEvent.HitTaken(msg.shooterId, msg.eliminated))
             }
             is ServerMessage.Tagged -> _state.update { s ->
                 val text = "${s.nameOf(msg.shooterId)} tagged ${s.nameOf(msg.victimId)}"
                 s.copy(feed = (s.feed + FeedItem(text, now)).takeLast(5))
             }
-            is ServerMessage.MatchEnded -> _state.update { it.copy(results = msg) }
+            is ServerMessage.MatchEnded -> {
+                sfx.play(Sfx.MATCH_END)
+                _state.update { it.copy(results = msg) }
+            }
             is ServerMessage.Error -> viewModelScope.launch {
                 if (_state.value.myId == 0) fail(msg.message) else _state.update { it.copy(error = msg.message) }
             }
@@ -327,8 +352,22 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
         if (now - lastShotAtMs < cooldown || s.me?.alive == false) return
         val pose = currentPose() ?: return _state.update { it.copy(error = "Waiting for GPS fix…") }
         lastShotAtMs = now
-        tones?.startTone(ToneGenerator.TONE_PROP_BEEP, 60)
+        // Tiny pitch variation keeps rapid fire from sounding robotic.
+        sfx.play(Sfx.LASER, rate = 0.94f + (shotSeq % 5) * 0.03f)
+        _events.tryEmit(GameEvent.Fired)
         client?.send(ClientMessage.Shoot(++shotSeq, pose))
+    }
+
+    /** UI cue when an enemy enters the crosshair. */
+    fun onLockAcquired() = sfx.play(Sfx.LOCK_ON, volume = 0.6f)
+
+    fun playHeartbeat() = sfx.play(Sfx.HEARTBEAT, volume = 0.8f)
+
+    fun toggleSound() {
+        val on = !_state.value.soundOn
+        sfx.enabled = on
+        prefs.edit().putBoolean("sound", on).apply()
+        _state.update { it.copy(soundOn = on) }
     }
 
     fun setTeam(team: Team) = client?.send(ClientMessage.SetTeam(team))
@@ -349,7 +388,7 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
             server?.stop()
         }.start()
         if (_state.value.transport != Transport.ONLINE) wifiDirect.leave()
-        _state.update { UiState(playerName = it.playerName, serverAddress = it.serverAddress, error = it.error) }
+        _state.update { UiState(playerName = it.playerName, serverAddress = it.serverAddress, error = it.error, soundOn = it.soundOn) }
     }
 
     private fun fail(message: String) {
@@ -366,6 +405,6 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
         wifiDirect.close()
         locations.stop()
         orientation.stop()
-        tones?.release()
+        sfx.release()
     }
 }
