@@ -82,6 +82,31 @@ class OrientationTracker(context: Context) : SensorEventListener {
     }
 }
 
+/**
+ * Ambient light sensor (lux). It sits on the front of the phone, so the rear flashlight barely
+ * affects it: a good torch-independent brightness signal. Null value = no sensor / no reading yet.
+ */
+class LightSensor(context: Context) : SensorEventListener {
+    private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+    private val sensor = sensorManager.getDefaultSensor(Sensor.TYPE_LIGHT)
+    @Volatile var lux: Float? = null
+        private set
+
+    val isAvailable get() = sensor != null
+
+    fun start() {
+        sensor?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL) }
+    }
+
+    fun stop() = sensorManager.unregisterListener(this)
+
+    override fun onSensorChanged(event: SensorEvent) {
+        lux = event.values[0]
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor, accuracy: Int) = Unit
+}
+
 /** High-accuracy GPS fixes via the fused location provider. */
 class LocationTracker(context: Context) {
     private val client = LocationServices.getFusedLocationProviderClient(context)

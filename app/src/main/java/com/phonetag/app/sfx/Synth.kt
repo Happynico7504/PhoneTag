@@ -11,7 +11,7 @@ import kotlin.math.sin
 import kotlin.random.Random
 
 /** Every sound effect in the game. All are synthesized at runtime, so no audio assets ship with the app. */
-enum class Sfx { LASER, HIT_CONFIRM, TAG, DAMAGE, TAGGED_OUT, RESPAWN, LOCK_ON, MATCH_START, MATCH_END, HEARTBEAT }
+enum class Sfx { LASER, HIT_CONFIRM, TAG, DAMAGE, TAGGED_OUT, RESPAWN, LOCK_ON, MATCH_START, MATCH_END, HEARTBEAT, BLOCKED }
 
 /**
  * Tiny offline synthesizer: renders each [Sfx] to 16-bit mono PCM. Pure Kotlin so it can be
@@ -51,6 +51,11 @@ object Synth {
                 tone(783.99, 0.15, Wave.TRIANGLE, decay = 4.0, gain = 0.6),
                 tone(659.25, 0.15, Wave.TRIANGLE, decay = 4.0, gain = 0.6),
                 tone(523.25, 0.6, Wave.TRIANGLE, decay = 2.0, gain = 0.6),
+            )
+            // Dull "thunk" of a shot hitting cover.
+            Sfx.BLOCKED -> mix(
+                sweep(320.0, 90.0, 0.16, Wave.TRIANGLE, decay = 16.0, gain = 0.8),
+                noise(0.05, decay = 70.0, gain = 0.2),
             )
             Sfx.HEARTBEAT -> concat(
                 tone(55.0, 0.11, Wave.SINE, decay = 18.0, gain = 1.0), silence(0.09),

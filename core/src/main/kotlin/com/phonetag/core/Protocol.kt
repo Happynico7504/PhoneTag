@@ -12,7 +12,7 @@ import kotlinx.serialization.json.Json
  * or on a dedicated machine on the internet, so the client never needs to care which.
  */
 object Protocol {
-    const val VERSION = 2
+    const val VERSION = 3
 
     /** Hard cap on players per lobby. Never configurable above this. */
     const val MAX_PLAYERS_PER_LOBBY = 16
@@ -20,7 +20,7 @@ object Protocol {
     const val DEFAULT_PORT = 47474
 
     /** Upper bound on a single framed line; protects the server from memory abuse. */
-    const val MAX_LINE_BYTES = 16 * 1024
+    const val MAX_LINE_BYTES = 64 * 1024
 
     val json = Json {
         classDiscriminator = "t"
@@ -96,13 +96,15 @@ data class Pose(
 @Serializable
 data class ArenaPose(val epoch: Int, val position: Vec3, val forward: Vec3)
 
-/** What the shooter's camera saw when firing (on-device person detection). */
+/** What the shooter's camera saw when firing. Every field is optional evidence. */
 @Serializable
 data class VisionHint(
-    /** True if a person's body box covered the crosshair, false if the camera saw nobody there. */
-    val personInCrosshair: Boolean,
+    /** True if a person's body box covered the crosshair, false if detection saw nobody there, null if unknown. */
+    val personInCrosshair: Boolean? = null,
     /** Distance estimated from the person's apparent height, if the whole body was visible. */
     val estDistanceM: Double? = null,
+    /** AR depth measured straight down the crosshair: nothing solid is closer than this. */
+    val clearDistanceM: Double? = null,
 )
 
 /** The lobby's shared AR frame. Bumping [epoch] invalidates every device's sync. */
@@ -186,6 +188,10 @@ sealed class ClientMessage {
     @Serializable @SerialName("beacon")
     data class SetBeacon(val epoch: Int, val screen: Rigid?) : ClientMessage()
 
+    /** Walls this phone's AR tracking currently sees, in arena coordinates (replaces its previous report). */
+    @Serializable @SerialName("walls")
+    data class ReportWalls(val epoch: Int, val walls: List<Wall>) : ClientMessage()
+
     /** Host only: start a fresh arena whose frame is defined by [referenceId]'s phone. */
     @Serializable @SerialName("arena")
     data class ResetArena(val referenceId: Int) : ClientMessage()
@@ -237,7 +243,13 @@ sealed class ServerMessage {
         val distanceM: Double?,
         val eliminated: Boolean,
         val method: HitMethod? = null,
+        /** The shot would have hit someone, but a wall or obstacle was in the way. */
+        val blocked: Boolean = false,
     ) : ServerMessage()
+
+    /** The shared wall map of the current arena epoch (sent when it changes, at most every 2 s). */
+    @Serializable @SerialName("walls")
+    data class Obstacles(val epoch: Int, val walls: List<Wall>) : ServerMessage()
 
     /** Sent to the player who got hit. */
     @Serializable @SerialName("hit")

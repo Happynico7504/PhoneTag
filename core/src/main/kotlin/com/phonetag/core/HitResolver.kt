@@ -16,8 +16,13 @@ import kotlin.math.sqrt
  *    players' GPS error.
  * 3. **On-device person detection.** If the shooter's camera saw a person under the crosshair
  *    (at a plausible distance) the GPS cone is widened, because GPS error shouldn't deny a visibly
- *    aimed shot. If the camera clearly saw nobody there at close range, it is narrowed, which
- *    also makes shooting through walls harder.
+ *    aimed shot. If the camera clearly saw nobody there at close range, it is narrowed.
+ *
+ * Every would-be hit is then checked for **obstacles** in the line of fire:
+ * - AR depth straight down the shooter's crosshair: something solid clearly in front of the
+ *   target (within the depth sensor's reliable range) blocks the shot.
+ * - The shared wall map, built from vertical surfaces every synced phone detects: if the shot's
+ *   ray crosses a wall before reaching the target, it is blocked.
  */
 object HitResolver {
     const val BODY_RADIUS_M = 0.6
@@ -40,9 +45,20 @@ object HitResolver {
     /** Beyond this, "no person detected" is more likely a detector miss than an empty crosshair. */
     const val VISION_RELIABLE_RANGE_M = 20.0
 
+    /** ARCore depth is trustworthy up to roughly this far; beyond it we don't block on depth. */
+    const val DEPTH_RELIABLE_M = 8.0
+    /** How much closer than the target the measured surface must be to count as an obstacle. */
+    const val DEPTH_MARGIN_ARENA_M = 0.75
+    const val DEPTH_MARGIN_GPS_MIN_M = 1.5
+    /** A wall must be at least this far in front of the target (targets lean on walls). */
+    const val WALL_MARGIN_M = 0.4
+
     data class Candidate(val id: Int, val pose: Pose)
 
     data class Hit(val targetId: Int, val distanceM: Double, val angleErrorDeg: Double, val method: HitMethod)
+
+    /** [hit] is the player hit, if any; [blockedId] is who would have been hit but for an obstacle. */
+    data class Resolution(val hit: Hit?, val blockedId: Int?)
 
     fun allowedConeDeg(distanceM: Double, shooterAccuracyM: Double, targetAccuracyM: Double): Double {
         val combined = sqrt(shooterAccuracyM * shooterAccuracyM + targetAccuracyM * targetAccuracyM)
@@ -64,25 +80,77 @@ object HitResolver {
         maxRangeM: Double,
         vision: VisionHint? = null,
         arenaEpoch: Int? = null,
-    ): Hit? {
+        walls: List<Wall> = emptyList(),
+    ): Hit? = resolveDetailed(shooter, candidates, maxRangeM, vision, arenaEpoch, walls).hit
+
+    fun resolveDetailed(
+        shooter: Pose,
+        candidates: List<Candidate>,
+        maxRangeM: Double,
+        vision: VisionHint? = null,
+        arenaEpoch: Int? = null,
+        walls: List<Wall> = emptyList(),
+    ): Resolution {
         var best: Hit? = null
         var bestScore = Double.MAX_VALUE
+        var blocked: Int? = null
+        var blockedScore = Double.MAX_VALUE
         for (c in candidates) {
             // Arena tracking, when it applies for this pair, is authoritative (a miss is a miss).
             val eval = evaluateArena(shooter, c, maxRangeM, arenaEpoch) ?: evaluateGps(shooter, c, maxRangeM, vision)
             val hit = eval.hit ?: continue
-            val score = eval.score
-            if (score < bestScore) {
-                bestScore = score
+            if (isObstructed(shooter, c, eval, vision, arenaEpoch, walls)) {
+                if (eval.score < blockedScore) {
+                    blockedScore = eval.score
+                    blocked = c.id
+                }
+                continue
+            }
+            if (eval.score < bestScore) {
+                bestScore = eval.score
                 best = hit
             }
         }
-        return best
+        return Resolution(best, if (best == null) blocked else null)
     }
 
-    private class Eval(val score: Double, val hit: Hit?)
+    /** [rangeM]: distance along the line of fire to where the shot meets the target. */
+    private class Eval(val score: Double, val hit: Hit?, val rangeM: Double = 0.0)
 
     private val MISS = Eval(Double.MAX_VALUE, null)
+
+    private fun isObstructed(shooter: Pose, c: Candidate, eval: Eval, vision: VisionHint?, epoch: Int?, walls: List<Wall>): Boolean {
+        val hit = eval.hit ?: return false
+        val precise = hit.method == HitMethod.ARENA
+        val range = eval.rangeM
+
+        // 1. Depth down the crosshair.
+        val clear = vision?.clearDistanceM
+        if (clear != null && clear > 0 && clear < DEPTH_RELIABLE_M) {
+            if (precise) {
+                if (clear < range - DEPTH_MARGIN_ARENA_M) return true
+            } else {
+                // GPS distance is rough, so demand a clear gap; and if the camera sees a person in
+                // the crosshair, the near surface is most likely that person, not a wall.
+                val acc = sqrt(shooter.accuracyM * shooter.accuracyM + c.pose.accuracyM * c.pose.accuracyM)
+                val margin = maxOf(DEPTH_MARGIN_GPS_MIN_M, acc * 0.5)
+                if (clear < range - margin && vision.personInCrosshair != true) return true
+            }
+        }
+
+        // 2. Shared wall map (needs the shooter's position and aim in the arena).
+        val a = shooter.arena ?: return false
+        if (walls.isEmpty() || a.epoch == 0 || (epoch != null && a.epoch != epoch)) return false
+        val dir = a.forward.normalized()
+        val maxT = if (precise) {
+            range - WALL_MARGIN_M
+        } else {
+            // Shooter is synced but the target isn't: stop well short of the GPS distance.
+            val acc = sqrt(shooter.accuracyM * shooter.accuracyM + c.pose.accuracyM * c.pose.accuracyM)
+            range - maxOf(DEPTH_MARGIN_GPS_MIN_M, acc * 0.5)
+        }
+        return Occlusion.firstHit(a.position, dir, maxT, walls) != null
+    }
 
     /** Null if arena tracking can't be used for this pair. */
     private fun evaluateArena(shooter: Pose, c: Candidate, maxRangeM: Double, epoch: Int?): Eval? {
@@ -100,7 +168,7 @@ object HitResolver {
         val radius = ARENA_BODY_RADIUS_M + ARENA_BASE_SLACK_M + ARENA_SLACK_PER_M * distance
         if (miss > radius) return MISS
         val err = Math.toDegrees(atan2(miss, along))
-        return Eval(miss / radius + distance / maxRangeM * 0.25, Hit(c.id, distance, err, HitMethod.ARENA))
+        return Eval(miss / radius + distance / maxRangeM * 0.25, Hit(c.id, distance, err, HitMethod.ARENA), along)
     }
 
     private fun evaluateGps(shooter: Pose, c: Candidate, maxRangeM: Double, vision: VisionHint?): Eval {
@@ -112,16 +180,16 @@ object HitResolver {
         var method = HitMethod.GPS
         if (vision != null) {
             val plausible = vision.estDistanceM == null || vision.estDistanceM in (d * 0.5)..(d * 2.0 + 3.0)
-            if (vision.personInCrosshair && plausible) {
+            if (vision.personInCrosshair == true && plausible) {
                 cone = (cone * VISION_WIDEN).coerceAtMost(MAX_CONE_DEG)
                 method = HitMethod.GPS_VISION
-            } else if (!vision.personInCrosshair && d <= VISION_RELIABLE_RANGE_M) {
+            } else if (vision.personInCrosshair == false && d <= VISION_RELIABLE_RANGE_M) {
                 cone = (cone * VISION_NARROW).coerceAtLeast(MIN_CONE_DEG)
             }
         }
         if (err > cone) return MISS
         // Normalised error (0 = dead centre, 1 = edge) plus a small distance term.
-        return Eval(err / cone + d / maxRangeM * 0.25, Hit(c.id, d, err, method))
+        return Eval(err / cone + d / maxRangeM * 0.25, Hit(c.id, d, err, method), d)
     }
 
     /**

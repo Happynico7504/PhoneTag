@@ -69,6 +69,7 @@ import com.phonetag.app.ar.ArSupport
 import com.phonetag.app.vision.PersonDetector
 import com.phonetag.app.vision.VisionGeometry
 import com.phonetag.app.GameViewModel
+import com.phonetag.app.TorchMode
 import com.phonetag.app.UiState
 import com.phonetag.core.GameMode
 import com.phonetag.core.Geo
@@ -112,11 +113,14 @@ fun GameScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
     fun visionNow() = VisionGeometry.hint(
         vm.personDetector.latest.value, SystemClock.elapsedRealtime(), viewSize.width.toFloat(), viewSize.height.toFloat(), focalPx(),
     )
-    // Client-side preview of the server's (fused) hit test: tells the player who is in the crosshair.
-    val lockedId = if (myPose == null || dead) null else HitResolver.resolve(
+    // Client-side preview of the server's (fused) hit test, including obstacles: tells the player
+    // who is in the crosshair, or that cover is in the way.
+    val preview = if (myPose == null || dead) null else HitResolver.resolveDetailed(
         myPose, enemies.map { HitResolver.Candidate(it.id, it.pose!!) }, lobby.settings.maxRangeM,
-        visionNow(), lobby.arena.epoch,
-    )?.targetId
+        vm.withDepth(visionNow()), lobby.arena.epoch, state.walls,
+    )
+    val lockedId = preview?.hit?.targetId
+    val blockedPreview = preview?.blockedId != null
     val personRect = detection?.takeIf { SystemClock.elapsedRealtime() - it.atMs < VisionGeometry.MAX_AGE_MS }?.person
         ?.let { VisionGeometry.toView(it, viewSize.width.toFloat(), viewSize.height.toFloat()) }
 
@@ -161,7 +165,12 @@ fun GameScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
     ) {
         when {
             useAr -> ArCameraView(vm.ar, Modifier.fillMaxSize())
-            cameraGranted -> CameraViewfinder(Modifier.fillMaxSize(), vm.personDetector, onFov = { fov = it })
+            cameraGranted -> CameraViewfinder(
+                Modifier.fillMaxSize(), vm.personDetector,
+                onFov = { fov = it },
+                onTorch = vm::attachCameraXTorch,
+                onBrightness = vm::onCameraXBrightness,
+            )
         }
 
         ArOverlay(
@@ -178,6 +187,8 @@ fun GameScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
             arView = { vm.ar.view.value },
             myArena = { vm.ar.arenaPose },
             person = personRect,
+            walls = state.walls,
+            blocked = blockedPreview,
         )
 
         Column(Modifier.fillMaxSize().safeDrawingPadding().padding(12.dp)) {
@@ -215,6 +226,8 @@ fun GameScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
                     useAr -> Chip("AR: not synced", Color(0xFFFFC107))
                 }
                 Spacer(Modifier.weight(1f))
+                TorchButton(state)
+                { vm.cycleTorchMode() }
                 TextButton(onClick = vm::toggleSound) { Text(if (state.soundOn) "Sound on" else "Muted", color = Color.White) }
             }
             if (!aim.compassReliable) {
@@ -230,7 +243,7 @@ fun GameScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
                 Radar(state, myPose, lobby.settings.maxRangeM, effects, Modifier.size(170.dp))
                 Spacer(Modifier.weight(1f))
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    FireButton(enabled = !dead && location != null, color = laserColor, onFire = { vm.fire(visionNow()) })
+                    FireButton(enabled = !dead && location != null, color = laserColor, onFire = { vm.fire(vm.withDepth(visionNow())) })
                     TextButton(onClick = vm::leave) { Text("Quit", color = Color.White) }
                 }
             }
@@ -334,9 +347,28 @@ private fun Radar(state: UiState, myPose: Pose?, rangeM: Double, effects: ArEffe
 }
 
 /** CameraX viewfinder for phones without ARCore; also feeds frames to person detection. */
+/** Flashlight mode (Auto / On / Off), with whether it's lit right now. Each phone decides alone. */
+@Composable
+fun TorchButton(state: UiState, onClick: () -> Unit) {
+    val mode = state.torchMode.name.lowercase().replaceFirstChar { it.uppercase() }
+    TextButton(onClick = onClick) {
+        Text("Light: $mode" + if (state.torchMode == TorchMode.AUTO && state.torchOn) " (on)" else "", color = if (state.torchOn) Color(0xFFFFE082) else Color.White)
+    }
+}
+
+/**
+ * CameraX viewfinder for phones without ARCore. Also feeds frames to person detection, reports
+ * image brightness and exposes the torch, for the automatic flashlight.
+ */
 @androidx.annotation.OptIn(ExperimentalCamera2Interop::class, ExperimentalGetImage::class)
 @Composable
-private fun CameraViewfinder(modifier: Modifier, detector: PersonDetector, onFov: (CameraFov) -> Unit) {
+private fun CameraViewfinder(
+    modifier: Modifier,
+    detector: PersonDetector,
+    onFov: (CameraFov) -> Unit,
+    onTorch: (((Boolean) -> Unit)?) -> Unit,
+    onBrightness: (Float) -> Unit,
+) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val previewView = remember { PreviewView(context).apply { scaleType = PreviewView.ScaleType.FILL_CENTER } }
@@ -351,6 +383,7 @@ private fun CameraViewfinder(modifier: Modifier, detector: PersonDetector, onFov
                 .build()
                 .also { a ->
                     a.setAnalyzer(analysisExecutor) { proxy ->
+                        onBrightness(lumaOf(proxy))
                         val image = proxy.image
                         if (image == null) proxy.close() else detector.process(image, proxy.imageInfo.rotationDegrees) { proxy.close() }
                     }
@@ -359,14 +392,35 @@ private fun CameraViewfinder(modifier: Modifier, detector: PersonDetector, onFov
                 provider.unbindAll()
                 val camera = provider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
                 cameraFov(Camera2CameraInfo.from(camera.cameraInfo))?.let(onFov)
+                if (camera.cameraInfo.hasFlashUnit()) onTorch { on -> camera.cameraControl.enableTorch(on) }
             }
         }, ContextCompat.getMainExecutor(context))
         onDispose {
+            onTorch(null)
             runCatching { future.get().unbindAll() }
             analysisExecutor.shutdown()
         }
     }
     AndroidView(factory = { previewView }, modifier = modifier)
+}
+
+/** Mean brightness (0..1) of the Y plane, sampled sparsely: cheap enough for every frame. */
+private fun lumaOf(proxy: androidx.camera.core.ImageProxy): Float {
+    val plane = proxy.planes[0]
+    val buf = plane.buffer
+    var sum = 0L
+    var n = 0
+    var y = 0
+    while (y < proxy.height) {
+        var x = 0
+        while (x < proxy.width) {
+            sum += buf.get(y * plane.rowStride + x * plane.pixelStride).toInt() and 0xFF
+            n++
+            x += 16
+        }
+        y += 16
+    }
+    return if (n == 0) 0f else sum / (n * 255f)
 }
 
 /** Field of view from the lens focal length and sensor size, so AR markers line up with the image. */

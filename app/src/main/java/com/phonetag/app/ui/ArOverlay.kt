@@ -38,6 +38,7 @@ import com.phonetag.core.PlayerSnapshot
 import com.phonetag.core.Pose
 import com.phonetag.core.Team
 import com.phonetag.core.Vec3
+import com.phonetag.core.Wall
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
@@ -91,6 +92,7 @@ class ArEffects {
     private var shakeAt = -1e9
     private var shieldUntil = -1e9
     private var heartbeatAt = -1e9
+    private var blockedAt = -1e9
     private var banner: Banner? = null
 
     private fun now() = System.nanoTime() / 1e9
@@ -154,10 +156,29 @@ class ArEffects {
                 shieldUntil = n + Lobby.SPAWN_PROTECTION_MS / 1000.0
                 banner = Banner("FIGHT!", RedTeam, n)
             }
+            GameEvent.ShotBlocked -> {
+                blockedAt = n
+                dust(density, n)
+            }
         }
     }
 
     fun onHeartbeat() { heartbeatAt = now() }
+
+    /** Grey debris puff where a shot hit cover. */
+    private fun dust(density: Float, born: Double) {
+        repeat(14) {
+            val angle = rnd.nextDouble(0.0, 2 * PI)
+            val speed = rnd.nextDouble(80.0, 260.0).toFloat() * density / 2.5f
+            particles += Particle(
+                x = 0f, y = 0f,
+                vx = cos(angle).toFloat() * speed, vy = sin(angle).toFloat() * speed - 200f * density / 2.5f,
+                born = born, life = rnd.nextDouble(0.3, 0.6),
+                color = listOf(Color(0xFF9E9E9E), Color(0xFFBDBDBD), Color(0xFF757575))[rnd.nextInt(3)],
+                radius = rnd.nextDouble(2.0, 4.0).toFloat() * density,
+            )
+        }
+    }
 
     /** Sparks flying out of the crosshair. Positions are relative to the screen centre. */
     private fun burst(count: Int, density: Float, born: Double, kill: Boolean) {
@@ -192,6 +213,7 @@ class ArEffects {
         dead: Boolean,
         locked: Boolean,
         myAzimuthDeg: Double,
+        blocked: Boolean = false,
     ) {
         val time = t
         val c = center
@@ -262,7 +284,15 @@ class ArEffects {
             )
         }
 
-        drawCrosshair(locked, time)
+        drawCrosshair(locked, blocked, time)
+
+        // "Blocked" feedback: label under the crosshair when a shot hit cover.
+        val blockedAge = time - blockedAt
+        if (blockedAge in 0.0..0.9) {
+            val a = (1 - blockedAge / 0.9).toFloat()
+            val layout = text.measure("BLOCKED", TextStyle(color = Color(0xFFBDBDBD).copy(alpha = a), fontSize = 16.sp, fontWeight = FontWeight.Black))
+            drawText(layout, topLeft = Offset(c.x - layout.size.width / 2f, c.y + 56 * dp))
+        }
 
         // Hit marker + elimination shockwave.
         val hitAge = time - hitMarkAt
@@ -309,10 +339,14 @@ class ArEffects {
         )
     }
 
-    private fun DrawScope.drawCrosshair(locked: Boolean, time: Double) {
+    private fun DrawScope.drawCrosshair(locked: Boolean, blocked: Boolean, time: Double) {
         val c = center
         val dp = density
-        val color = if (locked) RedTeam else Color.White
+        val color = when {
+            locked -> RedTeam
+            blocked -> Color(0xFF9E9E9E)
+            else -> Color.White
+        }
         val r = 34 * dp * (if (locked) 1f + 0.06f * sin(time * 14).toFloat() else 1f)
         drawCircle(Color.Black.copy(alpha = 0.35f), r, c, style = Stroke(5 * dp))
         drawCircle(color, r, c, style = Stroke(2.5f * dp))
@@ -322,6 +356,10 @@ class ArEffects {
             drawLine(color, Offset(c.x + dx * gap, c.y + dy * gap), Offset(c.x + dx * (gap + len), c.y + dy * (gap + len)), 2.5f * dp, StrokeCap.Round)
         }
         drawCircle(color, 2.5f * dp, c)
+        if (blocked && !locked) {
+            // Someone is lined up but cover is in the way: slash through the reticle.
+            drawLine(color, Offset(c.x - r * 0.7f, c.y + r * 0.7f), Offset(c.x + r * 0.7f, c.y - r * 0.7f), 3 * dp, StrokeCap.Round)
+        }
         if (locked) {
             // Spinning lock-on ticks.
             rotate((time * 180 % 360).toFloat(), c) {
@@ -384,6 +422,10 @@ fun ArOverlay(
     myArena: () -> ArenaPose? = { null },
     /** Person found by on-device detection, in view pixels. */
     person: ViewRect? = null,
+    /** Shared wall map (arena frame), drawn as translucent panels when AR-synced. */
+    walls: List<Wall> = emptyList(),
+    /** An enemy is lined up but an obstacle is in the way. */
+    blocked: Boolean = false,
 ) {
     val text = rememberTextMeasurer()
     Canvas(modifier) {
@@ -399,6 +441,7 @@ fun ArOverlay(
             val margin = 24 * density
             fun onScreen(o: Offset) = o.x in margin..(size.width - margin) && o.y in 0f..size.height
             val myArena = myPose.arena?.takeIf { arView != null && it.epoch == arView.epoch }
+            if (myArena != null && arView != null) drawWalls(walls, arView)
             val placed = players.mapNotNull { p ->
                 val pose = p.snap.pose ?: return@mapNotNull null
                 val theirArena = pose.arena
@@ -423,7 +466,7 @@ fun ArOverlay(
                 drawPlayerMarker(text, pl, horizonY, maxRangeM, pl.player.snap.id == lockedId, effects.t, edgeSlots)
             }
         }
-        with(effects) { drawEffects(text, laserColor, lowHealth, dead, lockedId != null, myPose?.azimuthDeg ?: 0.0) }
+        with(effects) { drawEffects(text, laserColor, lowHealth, dead, lockedId != null, myPose?.azimuthDeg ?: 0.0, blocked) }
     }
 }
 
@@ -442,6 +485,24 @@ private class Placed(
     /** Position comes from shared-arena camera tracking rather than GPS. */
     val precise: Boolean,
 )
+
+/** Walls from the shared map as translucent panels, so players can see what counts as cover. */
+private fun DrawScope.drawWalls(walls: List<Wall>, view: ArView) {
+    for (w in walls) {
+        val corners = listOf(-1.0 to -1.0, 1.0 to -1.0, 1.0 to 1.0, -1.0 to 1.0).map { (su, sv) ->
+            view.project(w.center + w.axisU * (su * w.halfU) + w.axisV * (sv * w.halfV), size.width, size.height)
+        }
+        // Skip walls partly behind the camera rather than drawing them inside-out.
+        val pts = corners.filterNotNull()
+        if (pts.size < 4) continue
+        val path = Path().apply {
+            pts.forEachIndexed { i, (x, y) -> if (i == 0) moveTo(x, y) else lineTo(x, y) }
+            close()
+        }
+        drawPath(path, Color(0x1A00E5FF))
+        drawPath(path, Color(0x6600E5FF), style = Stroke(1.5f * density))
+    }
+}
 
 /** Corner brackets around a person found by the on-device detector. */
 private fun DrawScope.drawPersonBox(r: ViewRect) {

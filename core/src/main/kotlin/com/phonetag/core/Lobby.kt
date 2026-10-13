@@ -50,6 +50,12 @@ class Lobby(
     var arena = ArenaInfo()
         private set
 
+    /** Shared wall map of the current arena epoch, per reporting phone. Kept when a player leaves: walls don't move. */
+    private val wallsByPlayer = LinkedHashMap<Int, List<Wall>>()
+    private var wallsDirty = false
+    private var wallsBroadcastAtMs = 0L
+    private val allWalls get() = wallsByPlayer.values.flatten().take(MAX_WALLS_TOTAL)
+
     @get:Synchronized
     val playerCount get() = players.size
 
@@ -71,6 +77,7 @@ class Lobby(
         if (hostId == 0) hostId = id
         p.sink(ServerMessage.Welcome(id, code))
         broadcastLobby()
+        if (wallsByPlayer.isNotEmpty()) p.sink(ServerMessage.Obstacles(arena.epoch, allWalls))
         return JoinResult.Joined(id)
     }
 
@@ -131,6 +138,11 @@ class Lobby(
                     p.beaconAtMs = clock()
                 }
             }
+            is ClientMessage.ReportWalls -> {
+                if (msg.epoch != arena.epoch || arena.epoch == 0) return
+                wallsByPlayer[p.id] = msg.walls.filter { it.isSane() }.take(MAX_WALLS_PER_PLAYER)
+                wallsDirty = true
+            }
             is ClientMessage.ResetArena -> {
                 if (!requireHost(p)) return
                 val ref = players[msg.referenceId]
@@ -140,7 +152,9 @@ class Lobby(
                 }
                 arena = ArenaInfo(epoch = arena.epoch + 1, referenceId = ref.id)
                 players.values.forEach { it.beacon = null }
+                wallsByPlayer.clear()
                 broadcastLobby()
+                broadcast(ServerMessage.Obstacles(arena.epoch, emptyList()))
             }
             is ClientMessage.Hello, ClientMessage.ListLobbies, ClientMessage.Leave -> Unit // handled by the server
         }
@@ -152,8 +166,13 @@ class Lobby(
      */
     @Synchronized
     fun tick() {
-        if (phase == Phase.ENDED) return
         val now = clock()
+        if (wallsDirty && now - wallsBroadcastAtMs >= WALLS_BROADCAST_INTERVAL_MS) {
+            wallsDirty = false
+            wallsBroadcastAtMs = now
+            broadcast(ServerMessage.Obstacles(arena.epoch, allWalls))
+        }
+        if (phase == Phase.ENDED) return
         if (phase == Phase.LOBBY) {
             broadcastSnapshot(now, timeLeftMs = 0)
             return
@@ -249,9 +268,10 @@ class Lobby(
                 !(settings.mode == GameMode.TEAMS && t.team == shooter.team)
         }.map { HitResolver.Candidate(it.id, it.pose!!) }
 
-        val hit = HitResolver.resolve(shooter.pose!!, candidates, settings.maxRangeM, msg.vision, arena.epoch)
+        val resolution = HitResolver.resolveDetailed(shooter.pose!!, candidates, settings.maxRangeM, msg.vision, arena.epoch, allWalls)
+        val hit = resolution.hit
         if (hit == null) {
-            shooter.sink(ServerMessage.ShotResult(msg.seq, null, null, false))
+            shooter.sink(ServerMessage.ShotResult(msg.seq, null, null, false, blocked = resolution.blockedId != null))
             return
         }
         val victim = players.getValue(hit.targetId)
@@ -326,5 +346,8 @@ class Lobby(
         /** Targets whose last fix is older than this can't be hit (they may have moved anywhere). */
         const val STALE_POSE_MS = 3_000L
         const val STALE_BEACON_MS = 1_500L
+        const val MAX_WALLS_PER_PLAYER = 32
+        const val MAX_WALLS_TOTAL = 192
+        const val WALLS_BROADCAST_INTERVAL_MS = 2_000L
     }
 }

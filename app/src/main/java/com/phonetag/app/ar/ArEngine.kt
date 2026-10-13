@@ -16,8 +16,12 @@ import com.google.ar.core.ArCoreApk
 import com.google.ar.core.AugmentedImage
 import com.google.ar.core.AugmentedImageDatabase
 import com.google.ar.core.Config
+import com.google.ar.core.Coordinates2d
 import com.google.ar.core.Frame
+import com.google.ar.core.LightEstimate
+import com.google.ar.core.Plane
 import com.google.ar.core.Session
+import com.google.ar.core.TrackingFailureReason
 import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.NotYetAvailableException
 import com.phonetag.core.ArenaCalibration
@@ -27,9 +31,11 @@ import com.phonetag.core.Geo
 import com.phonetag.core.Quat
 import com.phonetag.core.Rigid
 import com.phonetag.core.Vec3
+import com.phonetag.core.Wall
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.nio.ByteOrder
 import java.util.concurrent.Executors
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
@@ -90,6 +96,32 @@ class ArEngine(private val context: Context) {
     @Volatile var screenInArena: Rigid? = null
         private set
 
+    /** Walls (vertical planes) ARCore currently sees, in arena coordinates; [wallsVersion] bumps on change. */
+    @Volatile var walls: List<Wall> = emptyList()
+        private set
+    @Volatile var wallsVersion = 0
+        private set
+
+    /** AR depth straight down the crosshair (metres) and when it was measured. */
+    @Volatile private var crosshairDepthM: Double? = null
+    @Volatile private var crosshairDepthAtMs = 0L
+
+    /** Average camera image brightness 0..1 from ARCore light estimation. */
+    @Volatile var cameraBrightness: Float? = null
+        private set
+    /** Tracking is failing because the scene is too dark. */
+    @Volatile var insufficientLight = false
+        private set
+    /** The session is running (camera open). */
+    @Volatile var isRunning = false
+        private set
+    /** False if this phone's ARCore camera config can't drive the flashlight. */
+    @Volatile var torchSupported = true
+        private set
+    @Volatile private var desiredTorch = false
+    private var appliedTorch = false
+    private var depthSupported = false
+
     /** Receives camera frames for person detection; must close the image when done. */
     @Volatile var imageSink: ((Image, rotationDegrees: Int) -> Unit)? = null
 
@@ -138,7 +170,9 @@ class ArEngine(private val context: Context) {
                 val s = Session(activity)
                 session = s
                 sensorRotation = sensorOrientation(s)
-                configure(s, withImages = false)
+                depthSupported = s.isDepthModeSupported(Config.DepthMode.AUTOMATIC)
+                torchSupported = hasFlash(s)
+                configure(s)
                 // Marker database: ARCore's feature extraction is slow, so build it in the background.
                 worker.execute {
                     val db = AugmentedImageDatabase(s)
@@ -147,10 +181,11 @@ class ArEngine(private val context: Context) {
                             .onFailure { Log.w(TAG, "marker $slot rejected: $it") }
                     }
                     database = db
-                    if (session === s) runCatching { configure(s, withImages = true) }
+                    if (session === s) runCatching { configure(s) }
                 }
             }
             session?.resume()
+            isRunning = true
             return true
         } catch (e: Exception) {
             Log.w(TAG, "AR unavailable: $e")
@@ -160,7 +195,11 @@ class ArEngine(private val context: Context) {
     }
 
     fun pause() {
+        isRunning = false
         session?.pause()
+        cameraBrightness = null
+        insufficientLight = false
+        crosshairDepthM = null
         // Not tracking while paused: never report a frozen pose to the server.
         arenaPose = null
         screenInArena = null
@@ -175,16 +214,37 @@ class ArEngine(private val context: Context) {
         worker.shutdown()
     }
 
-    private fun configure(s: Session, withImages: Boolean) {
+    /** Switches the flashlight; applied on the next camera frame. Independent per phone. */
+    fun setTorch(on: Boolean) {
+        desiredTorch = on
+    }
+
+    /** Latest depth at the crosshair if it's fresh, else null. */
+    fun crosshairDepth(): Double? = crosshairDepthM?.takeIf { SystemClock.elapsedRealtime() - crosshairDepthAtMs < 400 }
+
+    @Synchronized
+    private fun configure(s: Session) {
         val config = Config(s).apply {
             updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
             focusMode = Config.FocusMode.AUTO
-            planeFindingMode = Config.PlaneFindingMode.DISABLED
-            lightEstimationMode = Config.LightEstimationMode.DISABLED
-            if (withImages) database?.let { augmentedImageDatabase = it }
+            // Vertical planes = walls for the shared obstacle map.
+            planeFindingMode = Config.PlaneFindingMode.VERTICAL
+            // Average image brightness, for the flashlight controller.
+            lightEstimationMode = Config.LightEstimationMode.AMBIENT_INTENSITY
+            // Per-pixel depth (from motion or a ToF sensor) for line-of-sight checks.
+            depthMode = if (depthSupported) Config.DepthMode.AUTOMATIC else Config.DepthMode.DISABLED
+            database?.let { augmentedImageDatabase = it }
         }
+        config.flashMode = if (desiredTorch && torchSupported) Config.FlashMode.TORCH else Config.FlashMode.OFF
         s.configure(config)
+        appliedTorch = config.flashMode == Config.FlashMode.TORCH
     }
+
+    /** ARCore can only drive the torch if the camera it uses has a flash unit. */
+    private fun hasFlash(s: Session): Boolean = runCatching {
+        val manager = context.getSystemService(CameraManager::class.java)
+        manager.getCameraCharacteristics(s.cameraConfig.cameraId).get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+    }.getOrDefault(false)
 
     private fun sensorOrientation(s: Session): Int = runCatching {
         val manager = context.getSystemService(CameraManager::class.java)
@@ -209,6 +269,7 @@ class ArEngine(private val context: Context) {
         override fun onDrawFrame(gl: GL10?) {
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
             val s = session ?: return
+            if (desiredTorch != appliedTorch && torchSupported) runCatching { configure(s) }
             if (textureBoundTo !== s) {
                 s.setCameraTextureName(background.textureId)
                 viewport?.let { (w, h) -> s.setDisplayGeometry(Surface.ROTATION_0, w, h) }
@@ -235,6 +296,8 @@ class ArEngine(private val context: Context) {
         val tracking = camera.trackingState == TrackingState.TRACKING
         val cameraWorld = camera.displayOrientedPose.toRigid()
         val now = SystemClock.elapsedRealtime()
+        insufficientLight = !tracking && camera.trackingFailureReason == TrackingFailureReason.INSUFFICIENT_LIGHT
+        frame.lightEstimate.takeIf { it.state == LightEstimate.State.VALID }?.let { cameraBrightness = it.pixelIntensity }
 
         // Arena reset in the lobby: forget the old anchor.
         val lobbyArena = arena
@@ -268,6 +331,7 @@ class ArEngine(private val context: Context) {
             val camArena = worldToArena * cameraWorld
             arenaPose = ArenaPose(localEpoch, camArena.position, camArena.rotation.rotate(Vec3.FORWARD))
             screenInArena = ArenaCalibration.screenPose(camArena)
+            collectWalls(s, worldToArena, now)
         } else {
             arenaPose = null
             screenInArena = null
@@ -290,6 +354,8 @@ class ArEngine(private val context: Context) {
             steady = steady,
         )
 
+        if (depthSupported && tracking) sampleCrosshairDepth(frame, now)
+
         // Hand a CPU copy of the camera image to person detection, ~8 times a second.
         val sink = imageSink
         if (sink != null && !imageBusy && now - lastImageAtMs > 120) {
@@ -302,6 +368,71 @@ class ArEngine(private val context: Context) {
             } catch (e: Exception) {
                 Log.w(TAG, "camera image: $e")
             }
+        }
+    }
+
+    private var lastWallsAtMs = 0L
+    private var lastDepthAtMs = 0L
+
+    /** Every 2 s: the largest vertical planes, as wall rectangles in arena coordinates. */
+    private fun collectWalls(s: Session, worldToArena: Rigid, now: Long) {
+        if (now - lastWallsAtMs < 2_000) return
+        lastWallsAtMs = now
+        val found = s.getAllTrackables(Plane::class.java)
+            .filter { it.trackingState == TrackingState.TRACKING && it.subsumedBy == null && it.type == Plane.Type.VERTICAL }
+            .filter { it.extentX * it.extentZ >= MIN_WALL_AREA_M2 }
+            .sortedByDescending { it.extentX * it.extentZ }
+            .take(MAX_WALLS)
+            .map { plane ->
+                val pose = worldToArena * plane.centerPose.toRigid()
+                // Plane polygons are convex hulls that overshoot a little; shrink the rectangle.
+                Wall(
+                    center = pose.position.rounded(),
+                    axisU = pose.rotation.rotate(Vec3(1.0, 0.0, 0.0)).rounded(),
+                    axisV = pose.rotation.rotate(Vec3(0.0, 0.0, 1.0)).rounded(),
+                    halfU = (plane.extentX / 2.0 * 0.9).roundTo3(),
+                    halfV = (plane.extentZ / 2.0 * 0.9).roundTo3(),
+                )
+            }
+        if (found != walls) {
+            walls = found
+            wallsVersion++
+        }
+    }
+
+    /** ~10 Hz: robust depth of a small patch at the view centre, i.e. what the crosshair is on. */
+    private fun sampleCrosshairDepth(frame: Frame, now: Long) {
+        if (now - lastDepthAtMs < 100) return
+        lastDepthAtMs = now
+        val (w, h) = viewport ?: return
+        val image = try {
+            frame.acquireDepthImage16Bits()
+        } catch (_: NotYetAvailableException) {
+            return
+        }
+        try {
+            val uv = FloatArray(2)
+            frame.transformCoordinates2d(Coordinates2d.VIEW, floatArrayOf(w / 2f, h / 2f), Coordinates2d.IMAGE_NORMALIZED, uv)
+            val cx = (uv[0] * image.width).toInt()
+            val cy = (uv[1] * image.height).toInt()
+            val plane = image.planes[0]
+            val buf = plane.buffer.order(ByteOrder.LITTLE_ENDIAN)
+            val values = ArrayList<Int>(25)
+            for (dy in -2..2) for (dx in -2..2) {
+                val x = cx + dx
+                val y = cy + dy
+                if (x !in 0 until image.width || y !in 0 until image.height) continue
+                val mm = buf.getShort(y * plane.rowStride + x * plane.pixelStride).toInt() and 0xFFFF
+                if (mm > 0) values += mm
+            }
+            if (values.size >= 5) {
+                values.sort()
+                // Lower quartile: the nearest solid thing near the centre, ignoring single-pixel noise.
+                crosshairDepthM = values[values.size / 4] / 1000.0
+                crosshairDepthAtMs = now
+            }
+        } finally {
+            image.close()
         }
     }
 
@@ -357,8 +488,13 @@ class ArEngine(private val context: Context) {
         const val TAG = "ArEngine"
         const val SAMPLES_NEEDED = 15
         const val SAMPLE_WINDOW_MS = 2_500L
+        const val MAX_WALLS = 32
+        const val MIN_WALL_AREA_M2 = 0.6f
     }
 }
+
+private fun Double.roundTo3() = Math.round(this * 1000) / 1000.0
+private fun Vec3.rounded() = Vec3(x.roundTo3(), y.roundTo3(), z.roundTo3())
 
 /** Projects an arena-frame point to screen pixels. Returns null if it's behind the camera. */
 fun ArView.project(p: Vec3, width: Float, height: Float): Pair<Float, Float>? {

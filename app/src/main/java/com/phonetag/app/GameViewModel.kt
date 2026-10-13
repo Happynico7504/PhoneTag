@@ -3,6 +3,7 @@ package com.phonetag.app
 import android.app.Application
 import android.content.Context
 import android.os.Build
+import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -14,6 +15,8 @@ import com.phonetag.app.net.GroupInfo
 import com.phonetag.app.net.NearbyGame
 import com.phonetag.app.net.WifiDirect
 import com.phonetag.app.sensors.Aim
+import com.phonetag.app.light.TorchController
+import com.phonetag.app.sensors.LightSensor
 import com.phonetag.app.sensors.LocationTracker
 import com.phonetag.app.sensors.OrientationTracker
 import com.phonetag.app.sfx.Sfx
@@ -31,6 +34,7 @@ import com.phonetag.core.Protocol
 import com.phonetag.core.ServerMessage
 import com.phonetag.core.Team
 import com.phonetag.core.VisionHint
+import com.phonetag.core.Wall
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -49,6 +53,9 @@ enum class Screen { HOME, NEARBY, ONLINE, CONNECTING, SESSION }
 
 enum class Transport { WIFI_DIRECT_HOST, WIFI_DIRECT_JOIN, ONLINE }
 
+/** Flashlight behaviour, chosen per phone. */
+enum class TorchMode { AUTO, ON, OFF }
+
 data class FeedItem(val text: String, val atMs: Long)
 
 /** One-shot moments the AR view turns into visual effects (beams, sparks, damage indicators…). */
@@ -58,6 +65,8 @@ sealed interface GameEvent {
     data class HitTaken(val shooterId: Int, val eliminated: Boolean) : GameEvent
     data object Respawned : GameEvent
     data object MatchStarted : GameEvent
+    /** Our shot would have hit, but a wall/obstacle was in the way. */
+    data object ShotBlocked : GameEvent
 }
 
 data class UiState(
@@ -78,6 +87,10 @@ data class UiState(
     val showArenaSync: Boolean = false,
     /** Showing our sync marker so other players can scan it. */
     val showingMarker: Boolean = false,
+    /** Shared wall map of the current arena (from every synced phone's plane detection). */
+    val walls: List<Wall> = emptyList(),
+    val torchMode: TorchMode = TorchMode.AUTO,
+    val torchOn: Boolean = false,
 ) {
     val me get() = snapshot?.players?.firstOrNull { it.id == myId }
     val isHost get() = lobby?.hostId == myId
@@ -119,6 +132,15 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
     val personDetector = PersonDetector()
     private var beaconSent = false
 
+    // Flashlight: decided locally on every phone, never synchronised.
+    private val lightSensor = LightSensor(app)
+    private val torch = TorchController()
+    @Volatile private var cameraXTorch: ((Boolean) -> Unit)? = null
+    @Volatile private var cameraXBrightness: Float? = null
+    private var torchApplied: Boolean? = null
+
+    private var wallsSentVersion = -1
+
     private var localServer: GameServer? = null
     private var client: GameClient? = null
     private var poseJob: Job? = null
@@ -141,6 +163,7 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
     fun onPermissionsGranted() {
         locations.start()
         orientation.start()
+        lightSensor.start()
         ar.imageSink = { image, rotation ->
             personDetector.process(image, rotation) {
                 image.close()
@@ -313,6 +336,8 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
                 val c = client ?: break
                 currentPose()?.let { c.send(ClientMessage.PoseUpdate(it)) }
                 sendBeacon(c)
+                sendWalls(c)
+                updateTorch()
                 if (tick++ % 25 == 0) c.send(ClientMessage.Ping(System.currentTimeMillis()))
                 delay(200)
             }
@@ -355,10 +380,17 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
                     _events.tryEmit(GameEvent.Respawned)
                 }
             }
-            is ServerMessage.ShotResult -> msg.hitPlayerId?.let { victim ->
-                sfx.play(if (msg.eliminated) Sfx.TAG else Sfx.HIT_CONFIRM)
-                _events.tryEmit(GameEvent.HitDealt(victim, msg.eliminated))
+            is ServerMessage.ShotResult -> {
+                val victim = msg.hitPlayerId
+                if (victim != null) {
+                    sfx.play(if (msg.eliminated) Sfx.TAG else Sfx.HIT_CONFIRM)
+                    _events.tryEmit(GameEvent.HitDealt(victim, msg.eliminated))
+                } else if (msg.blocked) {
+                    sfx.play(Sfx.BLOCKED)
+                    _events.tryEmit(GameEvent.ShotBlocked)
+                }
             }
+            is ServerMessage.Obstacles -> _state.update { it.copy(walls = msg.walls) }
             is ServerMessage.HitBy -> {
                 vibrate(if (msg.eliminated) 600 else 150)
                 sfx.play(if (msg.eliminated) Sfx.TAGGED_OUT else Sfx.DAMAGE)
@@ -425,6 +457,66 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Our AR walls go to the server whenever they change (the engine re-scans every 2 s). */
+    private fun sendWalls(c: GameClient) {
+        val version = ar.wallsVersion
+        if (version == wallsSentVersion || ar.arenaPose == null) return
+        wallsSentVersion = version
+        c.send(ClientMessage.ReportWalls(ar.arena.epoch, ar.walls))
+    }
+
+    /**
+     * Combines person detection ([base], from the UI's view geometry) with AR depth down the
+     * crosshair into the evidence sent with a shot.
+     */
+    fun withDepth(base: VisionHint?): VisionHint? {
+        val depth = ar.crosshairDepth() ?: return base
+        return (base ?: VisionHint()).copy(clearDistanceM = depth)
+    }
+
+    // ------------------------------------------------------------------ flashlight
+
+    /** Called by the CameraX viewfinder: how to switch its torch (null when it closes). */
+    fun attachCameraXTorch(sink: ((Boolean) -> Unit)?) {
+        cameraXTorch = sink
+        cameraXBrightness = null
+        torch.reset()
+        torchApplied = null
+    }
+
+    fun onCameraXBrightness(brightness: Float) {
+        cameraXBrightness = brightness
+    }
+
+    fun cycleTorchMode() = _state.update {
+        it.copy(torchMode = TorchMode.entries[(it.torchMode.ordinal + 1) % TorchMode.entries.size])
+    }
+
+    /** ~5 Hz: decide and apply the flashlight for whichever camera is open. */
+    private fun updateTorch() {
+        val usingAr = ar.isRunning
+        val cameraX = cameraXTorch
+        if (!usingAr && cameraX == null) return // no camera open: nothing to light
+        val want = when (_state.value.torchMode) {
+            TorchMode.ON -> true
+            TorchMode.OFF -> false
+            TorchMode.AUTO -> torch.update(
+                TorchController.Input(
+                    nowMs = SystemClock.elapsedRealtime(),
+                    lux = lightSensor.lux,
+                    cameraBrightness = if (usingAr) ar.cameraBrightness else cameraXBrightness,
+                    insufficientLight = usingAr && ar.insufficientLight,
+                )
+            )
+        }
+        if (want != torchApplied) {
+            torchApplied = want
+            if (usingAr) ar.setTorch(want) else cameraX?.invoke(want)
+            // The CameraX sink only exists if there is a flash unit; ARCore reports it separately.
+            _state.update { it.copy(torchOn = want && (!usingAr || ar.torchSupported)) }
+        }
+    }
+
     /** UI cue when an enemy enters the crosshair. */
     fun onLockAcquired() = sfx.play(Sfx.LOCK_ON, volume = 0.6f)
 
@@ -459,7 +551,13 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
         ar.myId = 0
         ar.beacons = emptyMap()
         beaconSent = false
-        _state.update { UiState(playerName = it.playerName, serverAddress = it.serverAddress, error = it.error, soundOn = it.soundOn) }
+        ar.setTorch(false)
+        torch.reset()
+        torchApplied = null
+        wallsSentVersion = -1
+        _state.update {
+            UiState(playerName = it.playerName, serverAddress = it.serverAddress, error = it.error, soundOn = it.soundOn, torchMode = it.torchMode)
+        }
     }
 
     private fun fail(message: String) {
@@ -475,6 +573,7 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
         leave()
         wifiDirect.close()
         locations.stop()
+        lightSensor.stop()
         orientation.stop()
         sfx.release()
         ar.close()

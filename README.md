@@ -67,6 +67,40 @@ The detected person gets corner brackets. The host can restart the arena at any 
 which starts a new epoch and everyone re-syncs. Phones without ARCore still take part using
 CameraX, GPS, compass and person detection.
 
+### Obstacles: no shooting through walls
+Every shot that would hit is also checked for line of sight (`core/.../Occlusion.kt`, `HitResolver`):
+
+- **Depth at the crosshair.** AR phones run the ARCore Depth API (depth from motion, or a ToF
+  sensor if the phone has one) and measure the depth straight down the crosshair about 10 times a
+  second. The value is sent with each shot. If something solid is clearly closer than the target,
+  and within about 8 m where depth is reliable, the shot is **blocked**. With precise arena
+  distances that means more than 0.75 m in front of the target. With GPS distances the margin
+  grows with GPS error, and the check is skipped if the camera sees a person in the crosshair,
+  because the near surface is then most likely that person.
+- **Shared wall map.** Synced AR phones detect vertical surfaces (ARCore plane finding) and
+  report the largest ones as rectangles in arena coordinates every 2 s. The server merges them
+  into one map for the arena epoch and keeps a wall even after the phone that found it leaves.
+  It ray-casts every shot from a synced shooter against that map. Walls near the *target* count
+  too, even when they're too far away for the shooter's depth sensor.
+- **Feedback.** The crosshair turns grey with a slash when an enemy is lined up behind cover, a
+  blocked shot plays a dull "thunk" with a debris puff and "BLOCKED", and known walls show as
+  translucent panels in the AR view.
+
+Without AR, there is no obstacle information beyond the camera's person check.
+
+### Automatic flashlight
+Every phone runs its own flashlight controller (`app/.../light/TorchController.kt`). Nothing
+is synced, so each device reacts to its own surroundings. It turns the torch on when:
+- the front **ambient light sensor** reads below 8 lux for 1 s, or
+- ARCore reports tracking is failing for **insufficient light**, or
+- the phone has no light sensor and the **camera image** is dark.
+
+It turns the torch off after the light sensor reads above 35 lux for 3 s, with tracking stable
+and at least 6 s after switching on. The gap between the two thresholds stops flickering. The
+torch brightens the camera image itself, so phones without a light sensor briefly switch it off
+every 20 s to measure the real ambient light. The HUD and the AR sync screen have a per-phone
+**Light: Auto / On / Off** switch.
+
 ### AR view & sound
 - **Player markers in the camera image.** Each player's GPS bearing is projected into the viewfinder
   using the real camera's field of view (read from the lens focal length and sensor size).

@@ -49,6 +49,6 @@ class SoundFx(private val context: Context) {
 
     private companion object {
         /** Bump when the synth recipes change so cached WAVs are regenerated. */
-        const val VERSION = 1
+        const val VERSION = 2
     }
 }

@@ -68,6 +68,7 @@ fun ArenaSyncScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("AR arena sync", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
+                    TorchButton(state) { vm.cycleTorchMode() }
                     TextButton(onClick = vm::closeArenaSync) { Text("Done") }
                 }
                 val reference = arena?.referenceId?.takeIf { it != 0 }?.let(state::nameOf)
