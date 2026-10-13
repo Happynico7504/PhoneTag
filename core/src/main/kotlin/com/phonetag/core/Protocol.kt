@@ -12,7 +12,7 @@ import kotlinx.serialization.json.Json
  * or on a dedicated machine on the internet, so the client never needs to care which.
  */
 object Protocol {
-    const val VERSION = 3
+    const val VERSION = 4
 
     /** Hard cap on players per lobby. Never configurable above this. */
     const val MAX_PLAYERS_PER_LOBBY = 16
@@ -44,7 +44,13 @@ enum class GameMode { FREE_FOR_ALL, TEAMS }
 enum class Phase { LOBBY, RUNNING, ENDED }
 
 @Serializable
-enum class ErrorCode { LOBBY_FULL, LOBBY_NOT_FOUND, MATCH_IN_PROGRESS, NOT_HOST, BAD_VERSION, BAD_REQUEST, SERVER_FULL }
+enum class ErrorCode {
+    LOBBY_FULL, LOBBY_NOT_FOUND, MATCH_IN_PROGRESS, NOT_HOST, BAD_VERSION, BAD_REQUEST, SERVER_FULL,
+    /** AR camera tracking is mandatory: phones without ARCore can't join. */
+    AR_REQUIRED,
+    /** The match can't start until every player is synced to the arena. */
+    NOT_SYNCED,
+}
 
 @Serializable
 data class GameSettings(
@@ -117,7 +123,6 @@ data class PlayerInfo(
     val name: String,
     val team: Team,
     val isHost: Boolean,
-    val arCapable: Boolean = false,
 )
 
 @Serializable
@@ -149,7 +154,10 @@ data class ScoreLine(val id: Int, val name: String, val team: Team, val score: I
 
 @Serializable
 sealed class ClientMessage {
-    /** First message on every connection. [lobbyCode] null + [create]=false joins the only lobby (Wi-Fi Direct). */
+    /**
+     * First message on every connection. [lobbyCode] null + [create]=false joins the only lobby
+     * (Wi-Fi Direct). [arTracking]: this phone runs ARCore camera tracking, which every player must.
+     */
     @Serializable @SerialName("hello")
     data class Hello(
         val protocol: Int,
@@ -157,6 +165,7 @@ sealed class ClientMessage {
         val create: Boolean = false,
         val lobbyCode: String? = null,
         val lobbyName: String? = null,
+        val arTracking: Boolean = false,
     ) : ClientMessage()
 
     @Serializable @SerialName("list")
@@ -179,10 +188,6 @@ sealed class ClientMessage {
 
     @Serializable @SerialName("shoot")
     data class Shoot(val seq: Int, val pose: Pose, val vision: VisionHint? = null) : ClientMessage()
-
-    /** Tells the server whether this phone supports ARCore camera tracking. */
-    @Serializable @SerialName("caps")
-    data class SetCapabilities(val ar: Boolean) : ClientMessage()
 
     /** Start (non-null [screen]) or stop showing this phone's sync marker. */
     @Serializable @SerialName("beacon")
@@ -245,6 +250,8 @@ sealed class ServerMessage {
         val method: HitMethod? = null,
         /** The shot would have hit someone, but a wall or obstacle was in the way. */
         val blocked: Boolean = false,
+        /** Rejected: the shooter's phone wasn't tracking in the arena when firing. */
+        val untracked: Boolean = false,
     ) : ServerMessage()
 
     /** The shared wall map of the current arena epoch (sent when it changes, at most every 2 s). */

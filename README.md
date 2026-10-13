@@ -1,8 +1,12 @@
 # PhoneTag
 
-Laser tag for Android phones. Every phone tracks every other player with **GPS + compass**:
-you aim by pointing your phone's camera at another player and hitting **FIRE**. The
-authoritative game server checks whether the other player was inside your line of fire.
+Laser tag for Android phones. Every phone tracks itself in 3D with **ARCore camera tracking**,
+backed up by GPS and compass, and all phones share one coordinate frame. You aim by pointing
+your phone's camera at another player and hitting **FIRE**. The authoritative game server checks
+whether the other player was in your line of fire and whether a wall was in the way.
+
+**AR tracking is mandatory, so the game is fair:** everyone's hits are judged the same precise way
+(see [Fair play](#fair-play-ar-is-required)).
 
 - **Wi-Fi Direct first.** One phone hosts and the others join it directly. No router or internet needed.
 - **Dedicated server fallback.** If players are too far apart for Wi-Fi Direct, run
@@ -63,9 +67,27 @@ How hits are decided (`core/.../HitResolver.kt`):
 | ...plus on-device **person detection** (ML Kit pose detection, offline) | A person under the crosshair at a plausible distance **widens** the GPS cone. A clearly empty crosshair within 20 m **narrows** it, which also makes shooting through walls harder. |
 
 AR markers in the view use the true 3D positions of synced players ("AR" in their label).
-The detected person gets corner brackets. The host can restart the arena at any time,
-which starts a new epoch and everyone re-syncs. Phones without ARCore still take part using
-CameraX, GPS, compass and person detection.
+The detected person gets corner brackets. Between matches the host can restart the arena,
+which starts a new epoch and everyone re-syncs.
+
+### Fair play: AR is required
+- **Install:** the manifest declares ARCore and `camera.ar` as required, so Google Play only
+  offers PhoneTag to ARCore phones and installs Google Play Services for AR with it. A sideloaded
+  copy on an unsupported phone stops at an "AR tracking required" screen.
+- **Join:** every `Hello` says whether the phone runs AR tracking, and the server (host phone or
+  dedicated) turns away phones that don't (`AR_REQUIRED`).
+- **Start:** the host can only start once **every** player is synced and tracking in the
+  arena. The lobby shows "not synced" next to anyone who isn't, and keeps a small live AR
+  camera running so players stay tracked until the match starts. The arena can't be reset
+  during a match.
+- **Shoot:** a shot only counts if the shooter's phone is tracking in the arena at that
+  moment. Otherwise it's rejected with "NOT TRACKING" and the fire button is disabled until
+  tracking returns.
+- **Get hit:** a target whose tracking drops stays hittable through their GPS position, so
+  losing tracking, or covering the camera, can never make you harder to hit.
+- **Re-sync mid-match:** synced players can tap **Share sync** in the HUD to show their marker,
+  and an unsynced player re-syncs by scanning it.
+- **Radar:** uses exact arena positions between synced players.
 
 ### Obstacles: no shooting through walls
 Every shot that would hit is also checked for line of sight (`core/.../Occlusion.kt`, `HitResolver`):
@@ -86,7 +108,6 @@ Every shot that would hit is also checked for line of sight (`core/.../Occlusion
   blocked shot plays a dull "thunk" with a debris puff and "BLOCKED", and known walls show as
   translucent panels in the AR view.
 
-Without AR, there is no obstacle information beyond the camera's person check.
 
 ### Automatic flashlight
 Every phone runs its own flashlight controller (`app/.../light/TorchController.kt`). Nothing
@@ -140,7 +161,7 @@ every 20 s to measure the real ambient light. The HUD and the AR sync screen hav
 |-----------|-----------------------------------------------------------------------------------------------|
 | `core/`   | Pure Kotlin/JVM: protocol, `Lobby` game engine, `HitResolver`, `GameServer`, `GameClient`. Unit + socket tests. |
 | `server/` | Dedicated server CLI (`phonetag-server`) + Dockerfile.                                        |
-| `app/`    | Android app (Kotlin, Jetpack Compose, CameraX, fused location, rotation-vector compass, Wi-Fi P2P). |
+| `app/`    | Android app (Kotlin, Jetpack Compose, ARCore, ML Kit pose detection, fused location, rotation-vector compass, Wi-Fi P2P). |
 
 ## Building
 
@@ -168,8 +189,10 @@ then either create a lobby and share its 5-letter code, or join from the open-lo
 
 ## Playing
 
-1. Everyone installs the APK and grants location, nearby-devices and camera permissions.
+1. Everyone installs the APK on an ARCore-supported phone and grants camera, location and nearby-devices permissions.
 2. **Nearby:** one player taps **Host a game**. The others tap **Join a nearby game** and pick it.
    **Far apart:** use **Play online** with a dedicated server.
-3. The host picks the mode, time and range, then taps **Start match**.
-4. Hold the phone upright like a camera, find players on the radar, put them in the crosshair and **FIRE**.
+3. Everyone syncs AR: the first phone in the lobby defines the arena. Each other player taps
+   **Sync** and scans the marker of anyone already synced, who taps **Share sync**, from 20–40 cm away.
+4. The host picks the mode, time and range, then taps **Start match** once everyone shows "AR synced".
+5. Hold the phone upright like a camera, find players on the radar, put them in the crosshair and **FIRE**.

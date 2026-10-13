@@ -22,6 +22,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.Color
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.phonetag.app.ar.ArSupport
+import com.phonetag.app.ui.ArGateScreen
 import com.phonetag.app.ui.PermissionScreen
 import com.phonetag.app.ui.PhoneTagApp
 
@@ -51,8 +53,8 @@ class MainActivity : ComponentActivity() {
                 val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
                     missing = missingPermissions()
                 }
-                // Location is essential; camera and nearby-devices only gate their own features.
-                val essentialGranted = Manifest.permission.ACCESS_FINE_LOCATION !in missing
+                // Location and camera (AR tracking is mandatory) are essential; nearby-devices only gates Wi-Fi Direct.
+                val essentialGranted = Manifest.permission.ACCESS_FINE_LOCATION !in missing && Manifest.permission.CAMERA !in missing
                 LaunchedEffect(essentialGranted) {
                     if (essentialGranted) vm.onPermissionsGranted()
                 }
@@ -60,16 +62,34 @@ class MainActivity : ComponentActivity() {
                     PermissionScreen(onRequest = { launcher.launch(requiredPermissions) })
                     LaunchedEffect(Unit) { launcher.launch(requiredPermissions) }
                 } else {
-                    val state by vm.state.collectAsStateWithLifecycle()
-                    BackHandler(enabled = state.screen != Screen.HOME) { vm.back() }
-                    PhoneTagApp(
-                        vm = vm,
-                        cameraGranted = Manifest.permission.CAMERA !in missing,
-                        nearbyGranted = Build.VERSION.SDK_INT < 33 || Manifest.permission.NEARBY_WIFI_DEVICES !in missing,
-                        onRequestPermissions = { launcher.launch(requiredPermissions) },
-                    )
+                    val support by vm.ar.support.collectAsStateWithLifecycle()
+                    LaunchedEffect(support) { if (support == ArSupport.SUPPORTED) vm.ar.ensureInstalled(this@MainActivity) }
+                    when (support) {
+                        ArSupport.CHECKING -> ArGateScreen("Checking AR support…", null)
+                        ArSupport.UNSUPPORTED -> ArGateScreen(
+                            "AR tracking required",
+                            "PhoneTag judges every hit with ARCore camera tracking so the game is fair for everyone. " +
+                                "This phone doesn't support ARCore (or Google Play Services for AR isn't installed), so it can't join games.",
+                        )
+                        ArSupport.SUPPORTED -> {
+                            val state by vm.state.collectAsStateWithLifecycle()
+                            BackHandler(enabled = state.screen != Screen.HOME) { vm.back() }
+                            PhoneTagApp(
+                                vm = vm,
+                                cameraGranted = true,
+                                nearbyGranted = Build.VERSION.SDK_INT < 33 || Manifest.permission.NEARBY_WIFI_DEVICES !in missing,
+                                onRequestPermissions = { launcher.launch(requiredPermissions) },
+                            )
+                        }
+                    }
                 }
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Returning from the Play Store after installing Google Play Services for AR.
+        vm.ar.ensureInstalled(this)
     }
 }

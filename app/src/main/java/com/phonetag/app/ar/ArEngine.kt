@@ -153,6 +153,27 @@ class ArEngine(private val context: Context) {
     }
 
     /**
+     * Makes sure Google Play Services for AR is installed and current, prompting the user if
+     * not. Call from the activity's onResume. Returns true once it's ready.
+     */
+    fun ensureInstalled(activity: Activity): Boolean {
+        if (_support.value != ArSupport.SUPPORTED) return false
+        return try {
+            when (ArCoreApk.getInstance().requestInstall(activity, !installRequested)) {
+                ArCoreApk.InstallStatus.INSTALLED -> true
+                ArCoreApk.InstallStatus.INSTALL_REQUESTED -> {
+                    installRequested = true
+                    false
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "ARCore install failed: $e")
+            _support.value = ArSupport.UNSUPPORTED
+            false
+        }
+    }
+
+    /**
      * Creates (installing Google Play Services for AR if needed) and resumes the session.
      * Returns false if AR can't run right now. Requires the CAMERA permission.
      */

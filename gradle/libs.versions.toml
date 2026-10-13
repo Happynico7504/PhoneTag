@@ -8,7 +8,6 @@ activityCompose = "1.9.3"
 lifecycle = "2.8.7"
 coreKtx = "1.15.0"
 playServicesLocation = "21.3.0"
-camerax = "1.4.1"
 junit = "4.13.2"
 arcore = "1.46.0"
 mlkitPose = "18.0.0-beta5"
@@ -25,9 +24,6 @@ compose-ui = { module = "androidx.compose.ui:ui" }
 compose-ui-tooling-preview = { module = "androidx.compose.ui:ui-tooling-preview" }
 compose-material3 = { module = "androidx.compose.material3:material3" }
 play-services-location = { module = "com.google.android.gms:play-services-location", version.ref = "playServicesLocation" }
-camerax-camera2 = { module = "androidx.camera:camera-camera2", version.ref = "camerax" }
-camerax-lifecycle = { module = "androidx.camera:camera-lifecycle", version.ref = "camerax" }
-camerax-view = { module = "androidx.camera:camera-view", version.ref = "camerax" }
 junit = { module = "junit:junit", version.ref = "junit" }
 arcore = { module = "com.google.ar:core", version.ref = "arcore" }
 mlkit-pose-detection = { module = "com.google.mlkit:pose-detection", version.ref = "mlkitPose" }

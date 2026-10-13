@@ -76,7 +76,7 @@ fun ArenaSyncScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
                 val (headline, detail) = when {
                     support == ArSupport.CHECKING -> "Checking AR support…" to ""
                     support == ArSupport.UNSUPPORTED -> "This phone can't do AR tracking" to
-                        "You'll still play with GPS, compass and camera person detection."
+                        "PhoneTag requires ARCore, so this phone can't play."
                     !cameraGranted -> "Camera permission needed" to "Allow camera access to use AR tracking."
                     arena == null || arena.epoch == 0 -> "No arena yet" to "It starts as soon as an AR-capable phone joins."
                     !sync.tracking -> "Starting tracking…" to "Move the phone slowly so it can map the room."
@@ -114,7 +114,7 @@ fun ArenaSyncScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
 
 /** The sync marker, drawn at its exact physical size so ARCore can measure its distance. */
 @Composable
-private fun MarkerCard(slot: Int, steady: Boolean, modifier: Modifier) {
+internal fun MarkerCard(slot: Int, steady: Boolean, modifier: Modifier) {
     val context = LocalContext.current
     val density = LocalDensity.current
     val bitmap = remember(slot) { SyncMarkers.bitmap(slot).asImageBitmap() }

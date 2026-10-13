@@ -3,6 +3,11 @@ package com.phonetag.core
 /**
  * Authoritative game state for one lobby (max 16 players).
  *
+ * AR camera tracking is mandatory for fairness: only AR-capable phones may join, a match only
+ * starts once everyone is synced to the shared arena, and only a phone that is tracking in the
+ * arena can fire. A target whose tracking drops stays hittable via its GPS position, so losing
+ * tracking (or covering the camera) never protects you.
+ *
  * Pure logic: no sockets or threads. Every public method is synchronized so the network layer
  * can call it from any connection thread, and outgoing messages go through each player's [sink],
  * which must not block (see [Connection.send]). Time comes from [clock] so tests can drive it.
@@ -25,12 +30,11 @@ class Lobby(
         var lastShotAtMs: Long = 0,
         var score: Int = 0,
         var deaths: Int = 0,
-        var arCapable: Boolean = false,
         var beacon: Rigid? = null,
         var beaconAtMs: Long = 0,
     ) {
         val alive get() = health > 0
-        fun info(hostId: Int) = PlayerInfo(id, name, team, id == hostId, arCapable)
+        fun info(hostId: Int) = PlayerInfo(id, name, team, id == hostId)
     }
 
     sealed class JoinResult {
@@ -63,7 +67,10 @@ class Lobby(
     fun summary() = LobbySummary(code, name, players.size, settings.maxPlayers, phase)
 
     @Synchronized
-    fun join(playerName: String, sink: (ServerMessage) -> Unit): JoinResult {
+    fun join(playerName: String, arTracking: Boolean, sink: (ServerMessage) -> Unit): JoinResult {
+        if (!arTracking) {
+            return JoinResult.Rejected(ErrorCode.AR_REQUIRED, "This game needs AR camera tracking (ARCore), which this phone doesn't support")
+        }
         if (players.size >= settings.maxPlayers) {
             return JoinResult.Rejected(ErrorCode.LOBBY_FULL, "Lobby is full (${settings.maxPlayers} players max)")
         }
@@ -75,6 +82,8 @@ class Lobby(
         if (settings.mode == GameMode.TEAMS) p.team = smallerTeam()
         players[id] = p
         if (hostId == 0) hostId = id
+        // The first player's phone defines the shared arena.
+        if (arena.epoch == 0) arena = ArenaInfo(epoch = 1, referenceId = id)
         p.sink(ServerMessage.Welcome(id, code))
         broadcastLobby()
         if (wallsByPlayer.isNotEmpty()) p.sink(ServerMessage.Obstacles(arena.epoch, allWalls))
@@ -120,15 +129,6 @@ class Lobby(
                 broadcastLobby()
             }
             is ClientMessage.Ping -> p.sink(ServerMessage.Pong(msg.clientTimeMs))
-            is ClientMessage.SetCapabilities -> {
-                p.arCapable = msg.ar
-                // First AR-capable phone (preferring the host) defines the arena automatically.
-                if (arena.referenceId == 0 && arena.epoch == 0 && msg.ar) {
-                    val ref = players[hostId]?.takeIf { it.arCapable } ?: p
-                    arena = ArenaInfo(epoch = 1, referenceId = ref.id)
-                }
-                broadcastLobby()
-            }
             is ClientMessage.SetBeacon -> {
                 val screen = msg.screen
                 if (screen == null || msg.epoch != arena.epoch || !screen.isFinite()) {
@@ -145,9 +145,14 @@ class Lobby(
             }
             is ClientMessage.ResetArena -> {
                 if (!requireHost(p)) return
+                if (phase == Phase.RUNNING) {
+                    // Would unsync everyone mid-match.
+                    p.sink(ServerMessage.Error(ErrorCode.MATCH_IN_PROGRESS, "Can't restart the arena during a match"))
+                    return
+                }
                 val ref = players[msg.referenceId]
-                if (ref == null || !ref.arCapable) {
-                    p.sink(ServerMessage.Error(ErrorCode.BAD_REQUEST, "That phone can't do AR tracking"))
+                if (ref == null) {
+                    p.sink(ServerMessage.Error(ErrorCode.BAD_REQUEST, "No such player"))
                     return
                 }
                 arena = ArenaInfo(epoch = arena.epoch + 1, referenceId = ref.id)
@@ -236,6 +241,13 @@ class Lobby(
             return
         }
         val now = clock()
+        val unsynced = players.values.filter { !it.isTrackedInArena(now) }
+        if (unsynced.isNotEmpty()) {
+            players[hostId]?.sink?.invoke(
+                ServerMessage.Error(ErrorCode.NOT_SYNCED, "Waiting for ${unsynced.joinToString { it.name }} to sync AR tracking")
+            )
+            return
+        }
         if (settings.mode == GameMode.TEAMS) {
             players.values.filter { it.team == Team.NONE }.forEach { it.team = smallerTeam() }
         }
@@ -261,6 +273,11 @@ class Lobby(
         shooter.lastShotAtMs = now
         // The shot carries the freshest fix of the shooter; use it as their pose too.
         updatePose(shooter, msg.pose)
+        if (shooter.pose?.arena == null) {
+            // Fairness: everyone shoots with precise camera tracking or not at all.
+            shooter.sink(ServerMessage.ShotResult(msg.seq, null, null, false, untracked = true))
+            return
+        }
 
         val candidates = players.values.filter { t ->
             t.id != shooter.id && t.alive && now >= t.invulnerableUntilMs &&
@@ -330,6 +347,9 @@ class Lobby(
     }
 
     private fun broadcast(msg: ServerMessage) = players.values.forEach { it.sink(msg) }
+
+    private fun Player.isTrackedInArena(now: Long) =
+        pose?.arena?.epoch == arena.epoch && now - poseAtMs <= STALE_POSE_MS
 
     private fun Pose.isPlausible() =
         lat in -90.0..90.0 && lon in -180.0..180.0 && accuracyM >= 0 &&

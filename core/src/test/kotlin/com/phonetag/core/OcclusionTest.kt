@@ -76,11 +76,10 @@ class OcclusionTest {
         val inbox = mutableMapOf<Int, MutableList<ServerMessage>>()
         fun join(n: String): Int {
             val box = mutableListOf<ServerMessage>()
-            return (lobby.join(n) { box += it } as Lobby.JoinResult.Joined).playerId.also { inbox[it] = box }
+            return (lobby.join(n, arTracking = true) { box += it } as Lobby.JoinResult.Joined).playerId.also { inbox[it] = box }
         }
         val a = join("a")
         val b = join("b")
-        lobby.handle(a, ClientMessage.SetCapabilities(true))
         lobby.handle(b, ClientMessage.ReportWalls(1, listOf(wallAt(8.0), wallAt(8.0).copy(halfU = 1e9)))) // insane one dropped
         lobby.tick()
         val obstacles = inbox.getValue(a).filterIsInstance<ServerMessage.Obstacles>().last()
@@ -90,7 +89,12 @@ class OcclusionTest {
         val c = join("c")
         assertTrue(inbox.getValue(c).any { it is ServerMessage.Obstacles && it.walls.size == 1 })
 
+        // Everyone must be synced before the match can start (c too).
+        lobby.handle(a, ClientMessage.PoseUpdate(shooter))
+        lobby.handle(b, ClientMessage.PoseUpdate(gps.copy(arena = arena(Vec3(0.0, 1.5, -15.0)))))
+        lobby.handle(c, ClientMessage.PoseUpdate(gps.copy(arena = arena(Vec3(5.0, 1.5, 5.0)))))
         lobby.handle(a, ClientMessage.StartMatch)
+        assertEquals(Phase.RUNNING, lobby.phase)
         now += Lobby.SPAWN_PROTECTION_MS
         lobby.handle(b, ClientMessage.PoseUpdate(gps.copy(arena = arena(Vec3(0.0, 1.5, -15.0)))))
         lobby.handle(a, ClientMessage.Shoot(1, shooter))
@@ -98,7 +102,9 @@ class OcclusionTest {
         assertNull(result.hitPlayerId)
         assertTrue(result.blocked)
 
-        // Resetting the arena clears the map.
+        // Resetting the arena (between matches) clears the map.
+        now += lobby.settings.matchDurationSec * 1000L
+        lobby.tick()
         lobby.handle(a, ClientMessage.ResetArena(a))
         assertEquals(emptyList(), inbox.getValue(b).filterIsInstance<ServerMessage.Obstacles>().last().walls)
     }

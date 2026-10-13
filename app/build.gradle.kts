@@ -44,9 +44,6 @@ dependencies {
     implementation(libs.compose.ui.tooling.preview)
     implementation(libs.compose.material3)
     implementation(libs.play.services.location)
-    implementation(libs.camerax.camera2)
-    implementation(libs.camerax.lifecycle)
-    implementation(libs.camerax.view)
     implementation(libs.arcore)
     implementation(libs.mlkit.pose.detection)
 

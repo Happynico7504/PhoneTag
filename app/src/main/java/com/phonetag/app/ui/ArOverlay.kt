@@ -160,6 +160,7 @@ class ArEffects {
                 blockedAt = n
                 dust(density, n)
             }
+            GameEvent.ShotUntracked -> banner = Banner("NOT TRACKING", Color(0xFFFFC107), n)
         }
     }
 

@@ -1,15 +1,6 @@
 package com.phonetag.app.ui
 
-import android.hardware.camera2.CameraCharacteristics
 import android.os.SystemClock
-import androidx.camera.camera2.interop.Camera2CameraInfo
-import androidx.camera.camera2.interop.ExperimentalCamera2Interop
-import androidx.camera.core.CameraSelector
-import androidx.camera.core.ExperimentalGetImage
-import androidx.camera.core.ImageAnalysis
-import androidx.camera.core.Preview
-import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.view.PreviewView
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.Canvas
@@ -34,7 +25,6 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -52,21 +42,16 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.viewinterop.AndroidView
-import androidx.core.content.ContextCompat
-import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.phonetag.app.GameEvent
 import com.phonetag.app.ar.ArCameraView
-import com.phonetag.app.ar.ArSupport
-import com.phonetag.app.vision.PersonDetector
+import com.phonetag.app.ar.SyncMarkers
 import com.phonetag.app.vision.VisionGeometry
 import com.phonetag.app.GameViewModel
 import com.phonetag.app.TorchMode
@@ -76,10 +61,10 @@ import com.phonetag.core.Geo
 import com.phonetag.core.HitResolver
 import com.phonetag.core.Lobby
 import com.phonetag.core.Pose
+import com.phonetag.core.Vec3
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import java.util.concurrent.Executors
-import kotlin.math.atan
+import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
@@ -96,13 +81,11 @@ fun GameScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
     val dead = me?.alive == false
     val lowHealth = me != null && me.alive && me.health <= 25
 
-    // Camera tracking: ARCore when the phone supports it, otherwise CameraX + GPS/compass.
-    val arSupport by vm.ar.support.collectAsStateWithLifecycle()
-    val useAr = arSupport == ArSupport.SUPPORTED && cameraGranted
+    // AR camera tracking is mandatory; GPS + compass only fill in while it (re)starts.
     val sync by vm.ar.sync.collectAsStateWithLifecycle()
     val detection by vm.personDetector.latest.collectAsStateWithLifecycle()
     var viewSize by remember { mutableStateOf(IntSize.Zero) }
-    var fov by remember { mutableStateOf(CameraFov()) }
+    val fov = CameraFov() // typical phone FOV, only used before ARCore reports real intrinsics
 
     // Recomposes with the compass (~50 Hz) anyway, so reading the latest arena pose here is fresh enough.
     val myPose = location?.let { Pose(it.latitude, it.longitude, it.accuracy.toDouble(), aim.azimuthDeg, aim.pitchDeg, vm.ar.arenaPose) }
@@ -163,15 +146,7 @@ fun GameScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
                 translationY = o.y
             },
     ) {
-        when {
-            useAr -> ArCameraView(vm.ar, Modifier.fillMaxSize())
-            cameraGranted -> CameraViewfinder(
-                Modifier.fillMaxSize(), vm.personDetector,
-                onFov = { fov = it },
-                onTorch = vm::attachCameraXTorch,
-                onBrightness = vm::onCameraXBrightness,
-            )
-        }
+        if (cameraGranted) ArCameraView(vm.ar, Modifier.fillMaxSize())
 
         ArOverlay(
             effects = effects,
@@ -222,8 +197,8 @@ fun GameScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
                 Spacer(Modifier.width(8.dp))
                 when {
                     sync.synced -> Chip("AR synced", Color(0xFF69F0AE))
-                    useAr && !sync.tracking -> Chip("AR: move slowly", Color(0xFFFFC107))
-                    useAr -> Chip("AR: not synced", Color(0xFFFFC107))
+                    !sync.tracking -> Chip("AR: move slowly", Color(0xFFFFC107))
+                    else -> Chip("AR: not synced", Color(0xFFFFC107))
                 }
                 Spacer(Modifier.weight(1f))
                 TorchButton(state)
@@ -234,6 +209,15 @@ fun GameScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
                 Text("Compass needs calibration: wave the phone in a figure 8", color = Color(0xFFFFC107), fontSize = 13.sp)
             }
             state.error?.let { Text(it, color = Color(0xFFFFC107), fontSize = 13.sp) }
+            if (!sync.synced && !dead) {
+                // Fairness rule: only tracked phones can fire. Explain how to get back in.
+                Text(
+                    if (!sync.tracking) "Tracking lost: move the phone slowly to recover. Your shots don't count until then."
+                    else "Not synced: scan a synced player's marker (they tap \"Share sync\"). Your shots don't count until then.",
+                    color = Color(0xFFFFC107), fontSize = 13.sp,
+                    modifier = Modifier.background(Color(0x99000000), RoundedCornerShape(6.dp)).padding(6.dp),
+                )
+            }
             state.feed.forEach { Text(it.text, color = Color.White, fontSize = 13.sp) }
 
             Spacer(Modifier.weight(1f))
@@ -243,10 +227,20 @@ fun GameScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
                 Radar(state, myPose, lobby.settings.maxRangeM, effects, Modifier.size(170.dp))
                 Spacer(Modifier.weight(1f))
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    FireButton(enabled = !dead && location != null, color = laserColor, onFire = { vm.fire(vm.withDepth(visionNow())) })
-                    TextButton(onClick = vm::leave) { Text("Quit", color = Color.White) }
+                    FireButton(enabled = !dead && location != null && sync.synced, color = laserColor, onFire = { vm.fire(vm.withDepth(visionNow())) })
+                    Row {
+                        // Synced players can help others re-sync mid-match by showing their marker.
+                        if (sync.synced) TextButton(onClick = vm::toggleMarker) {
+                            Text(if (state.showingMarker) "Hide marker" else "Share sync", color = Color.White)
+                        }
+                        TextButton(onClick = vm::leave) { Text("Quit", color = Color.White) }
+                    }
                 }
             }
+        }
+
+        if (state.showingMarker && sync.synced) {
+            MarkerCard(slot = SyncMarkers.slotFor(state.myId), steady = sync.steady, modifier = Modifier.align(Alignment.Center))
         }
 
         if (me != null && dead) {
@@ -329,11 +323,22 @@ private fun Radar(state: UiState, myPose: Pose?, rangeM: Double, effects: ArEffe
         drawLine(Color(0x5539FF14), c, Offset(c.x, c.y - r), 1.dp.toPx())
         drawCircle(Color.White, 4.dp.toPx(), c)
         if (myPose == null) return@Canvas
+        val mine = myPose.arena
         for (p in players) {
             if (p.id == state.myId) continue
             val pose = p.pose ?: continue
-            val d = Geo.distanceM(myPose.lat, myPose.lon, pose.lat, pose.lon)
-            val rel = Math.toRadians(Geo.signedAngleDeg(myPose.azimuthDeg, Geo.bearingDeg(myPose.lat, myPose.lon, pose.lat, pose.lon)))
+            val theirs = pose.arena
+            val (d, rel) = if (mine != null && theirs != null && mine.epoch == theirs.epoch) {
+                // Both tracked in the arena: exact relative position, heading-up.
+                val f = Vec3(mine.forward.x, 0.0, mine.forward.z).normalized()
+                val right = Vec3(-f.z, 0.0, f.x)
+                val v = theirs.position - mine.position
+                val flat = Vec3(v.x, 0.0, v.z)
+                flat.length() to atan2(flat dot right, flat dot f)
+            } else {
+                Geo.distanceM(myPose.lat, myPose.lon, pose.lat, pose.lon) to
+                    Math.toRadians(Geo.signedAngleDeg(myPose.azimuthDeg, Geo.bearingDeg(myPose.lat, myPose.lon, pose.lat, pose.lon)))
+            }
             val dist = min(d / rangeM, 1.0) * r
             val pos = Offset(c.x + (sin(rel) * dist).toFloat(), c.y - (cos(rel) * dist).toFloat())
             val color = when {
@@ -346,7 +351,6 @@ private fun Radar(state: UiState, myPose: Pose?, rangeM: Double, effects: ArEffe
     }
 }
 
-/** CameraX viewfinder for phones without ARCore; also feeds frames to person detection. */
 /** Flashlight mode (Auto / On / Off), with whether it's lit right now. Each phone decides alone. */
 @Composable
 fun TorchButton(state: UiState, onClick: () -> Unit) {
@@ -354,81 +358,4 @@ fun TorchButton(state: UiState, onClick: () -> Unit) {
     TextButton(onClick = onClick) {
         Text("Light: $mode" + if (state.torchMode == TorchMode.AUTO && state.torchOn) " (on)" else "", color = if (state.torchOn) Color(0xFFFFE082) else Color.White)
     }
-}
-
-/**
- * CameraX viewfinder for phones without ARCore. Also feeds frames to person detection, reports
- * image brightness and exposes the torch, for the automatic flashlight.
- */
-@androidx.annotation.OptIn(ExperimentalCamera2Interop::class, ExperimentalGetImage::class)
-@Composable
-private fun CameraViewfinder(
-    modifier: Modifier,
-    detector: PersonDetector,
-    onFov: (CameraFov) -> Unit,
-    onTorch: (((Boolean) -> Unit)?) -> Unit,
-    onBrightness: (Float) -> Unit,
-) {
-    val context = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
-    val previewView = remember { PreviewView(context).apply { scaleType = PreviewView.ScaleType.FILL_CENTER } }
-    DisposableEffect(lifecycleOwner) {
-        val analysisExecutor = Executors.newSingleThreadExecutor()
-        val future = ProcessCameraProvider.getInstance(context)
-        future.addListener({
-            val provider = future.get()
-            val preview = Preview.Builder().build().also { it.surfaceProvider = previewView.surfaceProvider }
-            val analysis = ImageAnalysis.Builder()
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .build()
-                .also { a ->
-                    a.setAnalyzer(analysisExecutor) { proxy ->
-                        onBrightness(lumaOf(proxy))
-                        val image = proxy.image
-                        if (image == null) proxy.close() else detector.process(image, proxy.imageInfo.rotationDegrees) { proxy.close() }
-                    }
-                }
-            runCatching {
-                provider.unbindAll()
-                val camera = provider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
-                cameraFov(Camera2CameraInfo.from(camera.cameraInfo))?.let(onFov)
-                if (camera.cameraInfo.hasFlashUnit()) onTorch { on -> camera.cameraControl.enableTorch(on) }
-            }
-        }, ContextCompat.getMainExecutor(context))
-        onDispose {
-            onTorch(null)
-            runCatching { future.get().unbindAll() }
-            analysisExecutor.shutdown()
-        }
-    }
-    AndroidView(factory = { previewView }, modifier = modifier)
-}
-
-/** Mean brightness (0..1) of the Y plane, sampled sparsely: cheap enough for every frame. */
-private fun lumaOf(proxy: androidx.camera.core.ImageProxy): Float {
-    val plane = proxy.planes[0]
-    val buf = plane.buffer
-    var sum = 0L
-    var n = 0
-    var y = 0
-    while (y < proxy.height) {
-        var x = 0
-        while (x < proxy.width) {
-            sum += buf.get(y * plane.rowStride + x * plane.pixelStride).toInt() and 0xFF
-            n++
-            x += 16
-        }
-        y += 16
-    }
-    return if (n == 0) 0f else sum / (n * 255f)
-}
-
-/** Field of view from the lens focal length and sensor size, so AR markers line up with the image. */
-@androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
-private fun cameraFov(info: Camera2CameraInfo): CameraFov? {
-    val sensor = info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE) ?: return null
-    val focal = info.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.minOrNull() ?: return null
-    if (focal <= 0f) return null
-    fun fov(side: Float) = Math.toDegrees(2 * atan(side / (2.0 * focal)))
-    return CameraFov(longDeg = fov(max(sensor.width, sensor.height)), shortDeg = fov(min(sensor.width, sensor.height)))
 }

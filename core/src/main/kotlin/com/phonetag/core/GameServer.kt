@@ -149,7 +149,7 @@ class GameServer(
                 send(err)
                 return
             }
-            when (val r = target.join(msg.name, ::send)) {
+            when (val r = target.join(msg.name, msg.arTracking, ::send)) {
                 is Lobby.JoinResult.Joined -> {
                     playerId = r.playerId
                     lobby = target

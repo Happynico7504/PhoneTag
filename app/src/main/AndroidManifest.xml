@@ -16,16 +16,18 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
-    <!-- Camera is only the aiming viewfinder. -->
+    <!-- Camera: ARCore tracking, aiming viewfinder and person detection. -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.VIBRATE" />
 
     <uses-feature android:name="android.hardware.wifi.direct" android:required="false" />
     <uses-feature android:name="android.hardware.location.gps" android:required="true" />
     <uses-feature android:name="android.hardware.sensor.compass" android:required="true" />
-    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
-    <!-- ARCore camera tracking is used when available; other phones fall back to GPS + compass. -->
-    <uses-feature android:name="android.hardware.camera.ar" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.any" android:required="true" />
+    <!-- AR camera tracking is mandatory so every player gets the same precise hit detection.
+         With these, Play only offers the app to ARCore phones and installs Google Play
+         Services for AR alongside it. -->
+    <uses-feature android:name="android.hardware.camera.ar" android:required="true" />
 
     <application
         android:allowBackup="false"
@@ -33,7 +35,7 @@
         android:label="@string/app_name"
         android:supportsRtl="true"
         android:theme="@style/Theme.PhoneTag">
-        <meta-data android:name="com.google.ar.core" android:value="optional" />
+        <meta-data android:name="com.google.ar.core" android:value="required" />
         <activity
             android:name=".MainActivity"
             android:exported="true"

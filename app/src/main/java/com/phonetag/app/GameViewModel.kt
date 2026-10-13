@@ -67,6 +67,8 @@ sealed interface GameEvent {
     data object MatchStarted : GameEvent
     /** Our shot would have hit, but a wall/obstacle was in the way. */
     data object ShotBlocked : GameEvent
+    /** Our shot was rejected because this phone wasn't tracking in the arena. */
+    data object ShotUntracked : GameEvent
 }
 
 data class UiState(
@@ -128,15 +130,13 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
 
     /** ARCore camera tracking + shared arena; idle on phones without ARCore. */
     val ar = ArEngine(app)
-    /** On-device person detection, fed by ARCore or CameraX frames. */
+    /** On-device person detection, fed by ARCore camera frames. */
     val personDetector = PersonDetector()
     private var beaconSent = false
 
     // Flashlight: decided locally on every phone, never synchronised.
     private val lightSensor = LightSensor(app)
     private val torch = TorchController()
-    @Volatile private var cameraXTorch: ((Boolean) -> Unit)? = null
-    @Volatile private var cameraXBrightness: Float? = null
     private var torchApplied: Boolean? = null
 
     private var wallsSentVersion = -1
@@ -168,13 +168,6 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
             personDetector.process(image, rotation) {
                 image.close()
                 ar.imageDone()
-            }
-        }
-        viewModelScope.launch {
-            // Tell the lobby once we know whether this phone can do AR.
-            ar.support.collect {
-                // Only once we're in a lobby: before the Welcome the server rejects anything but Hello.
-                if (it != ArSupport.CHECKING && _state.value.myId != 0) client?.send(ClientMessage.SetCapabilities(it == ArSupport.SUPPORTED))
             }
         }
         viewModelScope.launch {
@@ -240,7 +233,7 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
                         }
                     }
                     ok.onFailure { return@launch fail("Could not start game server: ${it.message}") }
-                    connectTo("127.0.0.1", Protocol.DEFAULT_PORT, ClientMessage.Hello(Protocol.VERSION, name, create = true, lobbyName = "$name's game"))
+                    connectTo("127.0.0.1", Protocol.DEFAULT_PORT, hello(create = true))
                 }
             },
             onError = ::fail,
@@ -254,7 +247,7 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
             game,
             onConnected = { ownerIp ->
                 _state.update { it.copy(status = "Joined Wi-Fi Direct group, opening game connection…") }
-                connectTo(ownerIp, Protocol.DEFAULT_PORT, ClientMessage.Hello(Protocol.VERSION, _state.value.playerName), retries = 8)
+                connectTo(ownerIp, Protocol.DEFAULT_PORT, hello(), retries = 8)
             },
             onError = ::fail,
         )
@@ -262,9 +255,22 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
 
     // ------------------------------------------------------------------ dedicated server
 
-    fun createOnline() = online(ClientMessage.Hello(Protocol.VERSION, _state.value.playerName, create = true, lobbyName = "${_state.value.playerName}'s game"))
+    fun createOnline() = online(hello(create = true))
 
-    fun joinOnline(code: String) = online(ClientMessage.Hello(Protocol.VERSION, _state.value.playerName, lobbyCode = code.trim().uppercase()))
+    fun joinOnline(code: String) = online(hello(lobbyCode = code.trim().uppercase()))
+
+    /** Every Hello declares AR tracking: the server turns away phones without it. */
+    private fun hello(create: Boolean = false, lobbyCode: String? = null): ClientMessage.Hello {
+        val name = _state.value.playerName
+        return ClientMessage.Hello(
+            protocol = Protocol.VERSION,
+            name = name,
+            create = create,
+            lobbyCode = lobbyCode,
+            lobbyName = if (create) "$name's game" else null,
+            arTracking = ar.support.value == ArSupport.SUPPORTED,
+        )
+    }
 
     fun refreshOnlineLobbies() {
         val (host, port) = parseAddress(_state.value.serverAddress) ?: return fail("Enter a server address like play.example.com:47474")
@@ -350,7 +356,6 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
             is ServerMessage.Welcome -> {
                 ar.myId = msg.playerId
                 _state.update { it.copy(myId = msg.playerId, screen = Screen.SESSION, status = null) }
-                if (ar.support.value != ArSupport.CHECKING) client?.send(ClientMessage.SetCapabilities(ar.support.value == ArSupport.SUPPORTED))
             }
             is ServerMessage.LobbyState -> {
                 ar.arena = msg.arena
@@ -388,6 +393,9 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
                 } else if (msg.blocked) {
                     sfx.play(Sfx.BLOCKED)
                     _events.tryEmit(GameEvent.ShotBlocked)
+                } else if (msg.untracked) {
+                    sfx.play(Sfx.BLOCKED, rate = 1.5f)
+                    _events.tryEmit(GameEvent.ShotUntracked)
                 }
             }
             is ServerMessage.Obstacles -> _state.update { it.copy(walls = msg.walls) }
@@ -476,27 +484,13 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
 
     // ------------------------------------------------------------------ flashlight
 
-    /** Called by the CameraX viewfinder: how to switch its torch (null when it closes). */
-    fun attachCameraXTorch(sink: ((Boolean) -> Unit)?) {
-        cameraXTorch = sink
-        cameraXBrightness = null
-        torch.reset()
-        torchApplied = null
-    }
-
-    fun onCameraXBrightness(brightness: Float) {
-        cameraXBrightness = brightness
-    }
-
     fun cycleTorchMode() = _state.update {
         it.copy(torchMode = TorchMode.entries[(it.torchMode.ordinal + 1) % TorchMode.entries.size])
     }
 
-    /** ~5 Hz: decide and apply the flashlight for whichever camera is open. */
+    /** ~5 Hz: decide and apply the flashlight while the AR camera is open. */
     private fun updateTorch() {
-        val usingAr = ar.isRunning
-        val cameraX = cameraXTorch
-        if (!usingAr && cameraX == null) return // no camera open: nothing to light
+        if (!ar.isRunning) return // no camera open: nothing to light
         val want = when (_state.value.torchMode) {
             TorchMode.ON -> true
             TorchMode.OFF -> false
@@ -504,16 +498,15 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
                 TorchController.Input(
                     nowMs = SystemClock.elapsedRealtime(),
                     lux = lightSensor.lux,
-                    cameraBrightness = if (usingAr) ar.cameraBrightness else cameraXBrightness,
-                    insufficientLight = usingAr && ar.insufficientLight,
+                    cameraBrightness = ar.cameraBrightness,
+                    insufficientLight = ar.insufficientLight,
                 )
             )
         }
         if (want != torchApplied) {
             torchApplied = want
-            if (usingAr) ar.setTorch(want) else cameraX?.invoke(want)
-            // The CameraX sink only exists if there is a flash unit; ARCore reports it separately.
-            _state.update { it.copy(torchOn = want && (!usingAr || ar.torchSupported)) }
+            ar.setTorch(want)
+            _state.update { it.copy(torchOn = want && ar.torchSupported) }
         }
     }
 

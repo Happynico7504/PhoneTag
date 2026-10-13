@@ -51,7 +51,11 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.phonetag.app.GameViewModel
 import com.phonetag.app.Screen
 import com.phonetag.app.Transport
+import com.phonetag.app.ar.ArCameraView
 import com.phonetag.app.ar.ArSupport
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.ui.draw.clip
 import com.phonetag.app.UiState
 import com.phonetag.core.GameMode
 import com.phonetag.core.Phase
@@ -80,7 +84,7 @@ fun PhoneTagApp(vm: GameViewModel, cameraGranted: Boolean, nearbyGranted: Boolea
                 state.lobby?.phase == Phase.RUNNING -> GameScreen(vm, state, cameraGranted)
                 state.showArenaSync -> ArenaSyncScreen(vm, state, cameraGranted)
                 state.results != null && state.lobby?.phase == Phase.ENDED -> ResultsScreen(vm, state, state.results!!)
-                else -> LobbyScreen(vm, state)
+                else -> LobbyScreen(vm, state, cameraGranted)
             }
         }
         // Errors during a running match are shown inside the HUD instead of as a dialog.
@@ -105,12 +109,32 @@ fun PermissionScreen(onRequest: () -> Unit) {
         Text("PhoneTag", fontSize = 40.sp, fontWeight = FontWeight.Black, color = MaterialTheme.colorScheme.primary)
         Spacer(Modifier.height(16.dp))
         Text(
-            "PhoneTag tracks every player with GPS and your compass so you can tag each other. " +
-                "It needs location, nearby Wi-Fi devices (for Wi-Fi Direct) and the camera (as your viewfinder).",
+            "PhoneTag tracks every player with AR camera tracking, backed up by GPS, so you can tag each other. " +
+                "It needs the camera, location and nearby Wi-Fi devices (for Wi-Fi Direct).",
             textAlign = TextAlign.Center,
         )
         Spacer(Modifier.height(24.dp))
         Button(onClick = onRequest) { Text("Grant permissions") }
+    }
+}
+
+/** Shown instead of the app while AR support is being checked, or if the phone can't do AR. */
+@Composable
+fun ArGateScreen(title: String, detail: String?) {
+    Column(
+        Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).safeDrawingPadding().padding(24.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text("PhoneTag", fontSize = 40.sp, fontWeight = FontWeight.Black, color = MaterialTheme.colorScheme.primary)
+        Spacer(Modifier.height(16.dp))
+        if (detail == null) CircularProgressIndicator()
+        Spacer(Modifier.height(16.dp))
+        Text(title, fontWeight = FontWeight.Bold, fontSize = 20.sp, textAlign = TextAlign.Center)
+        detail?.let {
+            Spacer(Modifier.height(8.dp))
+            Text(it, textAlign = TextAlign.Center, color = Color.LightGray)
+        }
     }
 }
 
@@ -151,7 +175,7 @@ private fun HomeScreen(vm: GameViewModel, state: UiState, nearbyGranted: Boolean
         Text("Too far apart? Use a dedicated server", style = MaterialTheme.typography.labelLarge, modifier = Modifier.fillMaxWidth())
         OutlinedButton(onClick = vm::openOnline, modifier = Modifier.fillMaxWidth()) { Text("Play online") }
         Spacer(Modifier.weight(1f))
-        Hint("Lobbies hold up to ${Protocol.MAX_PLAYERS_PER_LOBBY} players. Play outdoors with open sky for best GPS tracking.")
+        Hint("Lobbies hold up to ${Protocol.MAX_PLAYERS_PER_LOBBY} players. Everyone plays with AR camera tracking, so hits are judged the same way for all.")
     }
 }
 
@@ -258,7 +282,7 @@ private fun ConnectingScreen(status: String, onCancel: () -> Unit) {
 }
 
 @Composable
-private fun LobbyScreen(vm: GameViewModel, state: UiState) {
+private fun LobbyScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
     val lobby = state.lobby ?: return ConnectingScreen("Joining lobby…", vm::leave)
     val group by vm.groupInfo.collectAsStateWithLifecycle()
     val settings = lobby.settings
@@ -296,20 +320,19 @@ private fun LobbyScreen(vm: GameViewModel, state: UiState) {
                     Box(Modifier.size(12.dp).background(if (settings.mode == GameMode.TEAMS) p.team.color() else Color.Gray, CircleShape))
                     Spacer(Modifier.width(10.dp))
                     Text(p.name + if (p.id == state.myId) " (you)" else "", modifier = Modifier.weight(1f))
-                    // AR status: capable, synced to the shared arena, or the arena's reference phone.
-                    val arTag = when {
+                    // Everyone must be synced to the shared arena before the match can start.
+                    val (arTag, arColor) = when {
                         p.id == lobby.arena.referenceId && state.isSynced(p.id) -> "AR ref" to Color(0xFF69F0AE)
                         state.isSynced(p.id) -> "AR synced" to Color(0xFF69F0AE)
-                        p.arCapable -> "AR" to Color.Gray
-                        else -> null
+                        else -> "not synced" to Color(0xFFFFC107)
                     }
-                    arTag?.let { (t, c) -> Text(t, color = c, fontSize = 12.sp, modifier = Modifier.padding(end = 8.dp)) }
+                    Text(arTag, color = arColor, fontSize = 12.sp, modifier = Modifier.padding(end = 8.dp))
                     if (p.isHost) Text("HOST", color = MaterialTheme.colorScheme.primary, fontSize = 12.sp)
                 }
             }
         }
 
-        ArenaRow(vm, state)
+        ArenaRow(vm, state, cameraGranted)
 
         if (state.isHost) {
             Text("Settings", style = MaterialTheme.typography.titleMedium)
@@ -322,8 +345,15 @@ private fun LobbyScreen(vm: GameViewModel, state: UiState) {
             ChoiceRow("Range", listOf(30.0 to "30 m", 60.0 to "60 m", 100.0 to "100 m"), settings.maxRangeM) {
                 vm.updateSettings(settings.copy(maxRangeM = it))
             }
-            Button(onClick = vm::startMatch, enabled = lobby.players.size >= 2, modifier = Modifier.fillMaxWidth()) {
-                Text(if (lobby.players.size >= 2) "Start match" else "Waiting for players…")
+            val unsynced = lobby.players.count { !state.isSynced(it.id) }
+            Button(onClick = vm::startMatch, enabled = lobby.players.size >= 2 && unsynced == 0, modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    when {
+                        lobby.players.size < 2 -> "Waiting for players…"
+                        unsynced > 0 -> "Waiting for $unsynced to sync AR…"
+                        else -> "Start match"
+                    }
+                )
             }
         } else {
             Hint("Waiting for the host to start. ${settings.mode.label()}, ${settings.matchDurationSec / 60} min, ${settings.maxRangeM.toInt()} m range.")
@@ -332,34 +362,37 @@ private fun LobbyScreen(vm: GameViewModel, state: UiState) {
     }
 }
 
-/** AR camera tracking status for this phone, plus the host's choice of arena reference. */
+/**
+ * Live AR camera strip plus this phone's sync status. The camera keeps running in the lobby so
+ * the phone stays tracked (and synced) right up to the start of the match. The host also picks
+ * the arena's reference phone here.
+ */
 @Composable
-private fun ArenaRow(vm: GameViewModel, state: UiState) {
+private fun ArenaRow(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
     val lobby = state.lobby ?: return
-    val support by vm.ar.support.collectAsStateWithLifecycle()
     val sync by vm.ar.sync.collectAsStateWithLifecycle()
-    if (support == ArSupport.SUPPORTED) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                Text("AR camera tracking", style = MaterialTheme.typography.titleMedium)
-                Text(
-                    when {
-                        lobby.arena.epoch == 0 -> "Arena not started"
-                        sync.synced -> "Synced: precise 3D hits with other synced players"
-                        else -> "Not synced: sync for precise 3D hits"
-                    },
-                    color = if (sync.synced) Color(0xFF69F0AE) else Color.Gray, fontSize = 13.sp,
-                )
-            }
-            OutlinedButton(onClick = vm::openArenaSync, enabled = lobby.arena.epoch > 0) { Text(if (sync.synced) "Share sync" else "Sync") }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.size(width = 72.dp, height = 96.dp).clip(RoundedCornerShape(8.dp)).background(Color.Black)) {
+            if (cameraGranted) ArCameraView(vm.ar, Modifier.fillMaxSize())
         }
-    } else if (support == ArSupport.UNSUPPORTED) {
-        Hint("No AR on this phone: you'll be tracked by GPS + compass, with camera person detection.")
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text("AR tracking (required)", style = MaterialTheme.typography.titleMedium)
+            Text(
+                when {
+                    !sync.tracking -> "Starting: move the phone slowly"
+                    sync.isReference -> "Synced ✓ (this phone defines the arena)"
+                    sync.synced -> "Synced ✓"
+                    else -> "Not synced: tap Sync and scan a synced player's marker"
+                },
+                color = if (sync.synced) Color(0xFF69F0AE) else Color(0xFFFFC107), fontSize = 13.sp,
+            )
+        }
+        OutlinedButton(onClick = vm::openArenaSync, enabled = lobby.arena.epoch > 0) { Text(if (sync.synced) "Share sync" else "Sync") }
     }
-    val capable = lobby.players.filter { it.arCapable }
-    if (state.isHost && capable.isNotEmpty()) {
+    if (state.isHost) {
         // Picking a reference starts a fresh arena; everyone else re-syncs from it.
-        ChoiceRow("Arena", capable.map { it.id to it.name }, lobby.arena.referenceId) { if (it != lobby.arena.referenceId) vm.resetArena(it) }
+        ChoiceRow("Arena", lobby.players.map { it.id to it.name }, lobby.arena.referenceId) { if (it != lobby.arena.referenceId) vm.resetArena(it) }
     }
 }
 
@@ -367,7 +400,11 @@ private fun GameMode.label() = if (this == GameMode.TEAMS) "Teams" else "Free fo
 
 @Composable
 private fun <T> ChoiceRow(label: String, options: List<Pair<T, String>>, selected: T, onSelect: (T) -> Unit) {
-    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+    Row(
+        Modifier.horizontalScroll(rememberScrollState()), // up to 16 player names in the arena row
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
         Text(label, modifier = Modifier.width(56.dp), color = Color.Gray)
         options.forEach { (value, text) ->
             FilterChip(selected = value == selected, onClick = { onSelect(value) }, label = { Text(text) })
