@@ -25,9 +25,12 @@ class Lobby(
         var lastShotAtMs: Long = 0,
         var score: Int = 0,
         var deaths: Int = 0,
+        var arCapable: Boolean = false,
+        var beacon: Rigid? = null,
+        var beaconAtMs: Long = 0,
     ) {
         val alive get() = health > 0
-        fun info(hostId: Int) = PlayerInfo(id, name, team, id == hostId)
+        fun info(hostId: Int) = PlayerInfo(id, name, team, id == hostId, arCapable)
     }
 
     sealed class JoinResult {
@@ -43,6 +46,8 @@ class Lobby(
     var settings = GameSettings()
         private set
     var phase = Phase.LOBBY
+        private set
+    var arena = ArenaInfo()
         private set
 
     @get:Synchronized
@@ -73,6 +78,8 @@ class Lobby(
     fun leave(playerId: Int) {
         players.remove(playerId) ?: return
         if (playerId == hostId) hostId = players.keys.firstOrNull() ?: 0
+        // Synced players keep sharing the frame; only the "reference" label goes away.
+        if (playerId == arena.referenceId) arena = arena.copy(referenceId = 0)
         if (phase == Phase.RUNNING && players.size < 2) endMatch()
         broadcastLobby()
     }
@@ -106,15 +113,51 @@ class Lobby(
                 broadcastLobby()
             }
             is ClientMessage.Ping -> p.sink(ServerMessage.Pong(msg.clientTimeMs))
+            is ClientMessage.SetCapabilities -> {
+                p.arCapable = msg.ar
+                // First AR-capable phone (preferring the host) defines the arena automatically.
+                if (arena.referenceId == 0 && arena.epoch == 0 && msg.ar) {
+                    val ref = players[hostId]?.takeIf { it.arCapable } ?: p
+                    arena = ArenaInfo(epoch = 1, referenceId = ref.id)
+                }
+                broadcastLobby()
+            }
+            is ClientMessage.SetBeacon -> {
+                val screen = msg.screen
+                if (screen == null || msg.epoch != arena.epoch || !screen.isFinite()) {
+                    p.beacon = null
+                } else {
+                    p.beacon = screen
+                    p.beaconAtMs = clock()
+                }
+            }
+            is ClientMessage.ResetArena -> {
+                if (!requireHost(p)) return
+                val ref = players[msg.referenceId]
+                if (ref == null || !ref.arCapable) {
+                    p.sink(ServerMessage.Error(ErrorCode.BAD_REQUEST, "That phone can't do AR tracking"))
+                    return
+                }
+                arena = ArenaInfo(epoch = arena.epoch + 1, referenceId = ref.id)
+                players.values.forEach { it.beacon = null }
+                broadcastLobby()
+            }
             is ClientMessage.Hello, ClientMessage.ListLobbies, ClientMessage.Leave -> Unit // handled by the server
         }
     }
 
-    /** Called periodically (~5 Hz) by the server: respawns, match timer and world snapshot. */
+    /**
+     * Called periodically (~5 Hz) by the server: respawns, match timer and world snapshot.
+     * Snapshots also go out in the lobby so players can see each other and sync the AR arena.
+     */
     @Synchronized
     fun tick() {
-        if (phase != Phase.RUNNING) return
+        if (phase == Phase.ENDED) return
         val now = clock()
+        if (phase == Phase.LOBBY) {
+            broadcastSnapshot(now, timeLeftMs = 0)
+            return
+        }
         for (p in players.values) {
             if (!p.alive && now >= p.respawnAtMs) {
                 p.health = MAX_HEALTH
@@ -125,8 +168,12 @@ class Lobby(
             endMatch()
             return
         }
+        broadcastSnapshot(now, matchEndsAtMs - now)
+    }
+
+    private fun broadcastSnapshot(now: Long, timeLeftMs: Long) {
         val snap = ServerMessage.Snapshot(
-            timeLeftMs = matchEndsAtMs - now,
+            timeLeftMs = timeLeftMs,
             players = players.values.map {
                 PlayerSnapshot(
                     id = it.id,
@@ -136,6 +183,7 @@ class Lobby(
                     respawnInMs = if (it.alive) 0 else (it.respawnAtMs - now).coerceAtLeast(0),
                     score = it.score,
                     deaths = it.deaths,
+                    beacon = it.beacon?.takeIf { _ -> now - it.beaconAtMs <= STALE_BEACON_MS },
                 )
             },
         )
@@ -152,7 +200,13 @@ class Lobby(
 
     private fun updatePose(p: Player, pose: Pose) {
         if (!pose.isPlausible()) return
-        p.pose = pose
+        // Arena poses from an older (reset) arena epoch are meaningless now.
+        val arenaPose = pose.arena
+        p.pose = if (arenaPose != null && (arenaPose.epoch != arena.epoch || !arenaPose.position.isFinite() || !arenaPose.forward.isFinite())) {
+            pose.copy(arena = null)
+        } else {
+            pose
+        }
         p.poseAtMs = clock()
     }
 
@@ -195,7 +249,7 @@ class Lobby(
                 !(settings.mode == GameMode.TEAMS && t.team == shooter.team)
         }.map { HitResolver.Candidate(it.id, it.pose!!) }
 
-        val hit = HitResolver.resolve(msg.pose, candidates, settings.maxRangeM)
+        val hit = HitResolver.resolve(shooter.pose!!, candidates, settings.maxRangeM, msg.vision, arena.epoch)
         if (hit == null) {
             shooter.sink(ServerMessage.ShotResult(msg.seq, null, null, false))
             return
@@ -208,7 +262,7 @@ class Lobby(
             victim.respawnAtMs = now + settings.respawnSec * 1000L
             shooter.score++
         }
-        shooter.sink(ServerMessage.ShotResult(msg.seq, victim.id, hit.distanceM, eliminated))
+        shooter.sink(ServerMessage.ShotResult(msg.seq, victim.id, hit.distanceM, eliminated, hit.method))
         victim.sink(ServerMessage.HitBy(shooter.id, settings.damage, victim.health, eliminated))
         if (eliminated) broadcast(ServerMessage.Tagged(shooter.id, victim.id))
     }
@@ -250,6 +304,7 @@ class Lobby(
                 phase = phase,
                 settings = settings,
                 players = players.values.map { it.info(hostId) },
+                arena = arena,
             )
         )
     }
@@ -270,5 +325,6 @@ class Lobby(
         const val SPAWN_PROTECTION_MS = 3_000L
         /** Targets whose last fix is older than this can't be hit (they may have moved anywhere). */
         const val STALE_POSE_MS = 3_000L
+        const val STALE_BEACON_MS = 1_500L
     }
 }

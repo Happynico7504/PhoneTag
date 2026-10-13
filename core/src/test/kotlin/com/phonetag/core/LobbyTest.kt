@@ -134,3 +134,71 @@ class LobbyTest {
         assertEquals(b, state.hostId)
     }
 }
+
+class LobbyArenaTest {
+    private var now = 1_000_000L
+    private val lobby = Lobby("ABCDE", "test") { now }
+    private val inbox = mutableMapOf<Int, MutableList<ServerMessage>>()
+
+    private fun join(name: String): Int {
+        val box = mutableListOf<ServerMessage>()
+        val id = (lobby.join(name) { box += it } as Lobby.JoinResult.Joined).playerId
+        inbox[id] = box
+        return id
+    }
+
+    private fun lastLobby(id: Int) = inbox.getValue(id).filterIsInstance<ServerMessage.LobbyState>().last()
+
+    @Test
+    fun firstArCapablePhoneBecomesReferenceAndHostCanReset() {
+        val host = join("host")
+        val b = join("b")
+        lobby.handle(b, ClientMessage.SetCapabilities(ar = true))
+        assertEquals(ArenaInfo(1, b), lastLobby(host).arena)
+        assertTrue(lastLobby(host).players.first { it.id == b }.arCapable)
+
+        lobby.handle(host, ClientMessage.SetCapabilities(ar = true))
+        lobby.handle(host, ClientMessage.ResetArena(host))
+        assertEquals(ArenaInfo(2, host), lastLobby(b).arena)
+
+        // Non-hosts can't reset, and the reference must be AR-capable.
+        lobby.handle(b, ClientMessage.ResetArena(b))
+        assertEquals(2, lobby.arena.epoch)
+    }
+
+    @Test
+    fun beaconsAndArenaPosesFromOldEpochsAreDropped() {
+        val a = join("a")
+        val b = join("b")
+        lobby.handle(a, ClientMessage.SetCapabilities(ar = true))
+        val screen = Rigid(Vec3(1.0, 1.4, -2.0), Quat.IDENTITY)
+        lobby.handle(a, ClientMessage.SetBeacon(epoch = 1, screen = screen))
+        lobby.handle(a, ClientMessage.PoseUpdate(Pose(1.0, 1.0, 3.0, 0.0, arena = ArenaPose(1, Vec3.ZERO, Vec3.FORWARD))))
+        lobby.handle(b, ClientMessage.PoseUpdate(Pose(1.0, 1.0, 3.0, 0.0, arena = ArenaPose(7, Vec3.ZERO, Vec3.FORWARD))))
+        lobby.tick() // snapshots also flow in the lobby, for syncing
+        val snap = inbox.getValue(b).filterIsInstance<ServerMessage.Snapshot>().last()
+        assertEquals(screen, snap.players.first { it.id == a }.beacon)
+        assertEquals(1, snap.players.first { it.id == a }.pose?.arena?.epoch)
+        assertEquals(null, snap.players.first { it.id == b }.pose?.arena)
+
+        // Beacons go stale if the phone stops refreshing them.
+        now += Lobby.STALE_BEACON_MS + 1
+        lobby.tick()
+        assertEquals(null, inbox.getValue(b).filterIsInstance<ServerMessage.Snapshot>().last().players.first { it.id == a }.beacon)
+    }
+
+    @Test
+    fun arenaShotUsesPreciseRayCast() {
+        val a = join("a")
+        val b = join("b")
+        lobby.handle(a, ClientMessage.SetCapabilities(ar = true))
+        lobby.handle(a, ClientMessage.StartMatch)
+        now += Lobby.SPAWN_PROTECTION_MS
+        val gps = Pose(48.0, 11.0, 5.0, 90.0) // GPS heading points elsewhere entirely
+        lobby.handle(b, ClientMessage.PoseUpdate(gps.copy(arena = ArenaPose(1, Vec3(0.0, 1.5, -12.0), Vec3.FORWARD))))
+        lobby.handle(a, ClientMessage.Shoot(1, gps.copy(arena = ArenaPose(1, Vec3(0.0, 1.5, 0.0), Vec3.FORWARD))))
+        val result = inbox.getValue(a).filterIsInstance<ServerMessage.ShotResult>().single()
+        assertEquals(b, result.hitPlayerId)
+        assertEquals(HitMethod.ARENA, result.method)
+    }
+}

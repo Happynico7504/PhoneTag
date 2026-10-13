@@ -1,9 +1,12 @@
 package com.phonetag.app.ui
 
 import android.hardware.camera2.CameraCharacteristics
+import android.os.SystemClock
 import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.ExperimentalGetImage
+import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
@@ -51,6 +54,8 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -59,6 +64,10 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.phonetag.app.GameEvent
+import com.phonetag.app.ar.ArCameraView
+import com.phonetag.app.ar.ArSupport
+import com.phonetag.app.vision.PersonDetector
+import com.phonetag.app.vision.VisionGeometry
 import com.phonetag.app.GameViewModel
 import com.phonetag.app.UiState
 import com.phonetag.core.GameMode
@@ -68,6 +77,7 @@ import com.phonetag.core.Lobby
 import com.phonetag.core.Pose
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.util.concurrent.Executors
 import kotlin.math.atan
 import kotlin.math.cos
 import kotlin.math.max
@@ -85,17 +95,33 @@ fun GameScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
     val dead = me?.alive == false
     val lowHealth = me != null && me.alive && me.health <= 25
 
-    val myPose = location?.let { Pose(it.latitude, it.longitude, it.accuracy.toDouble(), aim.azimuthDeg, aim.pitchDeg) }
+    // Camera tracking: ARCore when the phone supports it, otherwise CameraX + GPS/compass.
+    val arSupport by vm.ar.support.collectAsStateWithLifecycle()
+    val useAr = arSupport == ArSupport.SUPPORTED && cameraGranted
+    val sync by vm.ar.sync.collectAsStateWithLifecycle()
+    val detection by vm.personDetector.latest.collectAsStateWithLifecycle()
+    var viewSize by remember { mutableStateOf(IntSize.Zero) }
+    var fov by remember { mutableStateOf(CameraFov()) }
+
+    // Recomposes with the compass (~50 Hz) anyway, so reading the latest arena pose here is fresh enough.
+    val myPose = location?.let { Pose(it.latitude, it.longitude, it.accuracy.toDouble(), aim.azimuthDeg, aim.pitchDeg, vm.ar.arenaPose) }
     val others = state.snapshot?.players.orEmpty().filter { it.id != state.myId }
     val enemies = others.filter { p -> p.alive && p.pose != null && !(teams && state.teamOf(p.id) == myTeam) }
-    // Client-side preview of the server's hit test: tells the player who is in the crosshair.
+
+    fun focalPx() = vm.ar.view.value?.focalPx ?: fov.focalPx(viewSize.width.toFloat(), viewSize.height.toFloat())
+    fun visionNow() = VisionGeometry.hint(
+        vm.personDetector.latest.value, SystemClock.elapsedRealtime(), viewSize.width.toFloat(), viewSize.height.toFloat(), focalPx(),
+    )
+    // Client-side preview of the server's (fused) hit test: tells the player who is in the crosshair.
     val lockedId = if (myPose == null || dead) null else HitResolver.resolve(
         myPose, enemies.map { HitResolver.Candidate(it.id, it.pose!!) }, lobby.settings.maxRangeM,
+        visionNow(), lobby.arena.epoch,
     )?.targetId
+    val personRect = detection?.takeIf { SystemClock.elapsedRealtime() - it.atMs < VisionGeometry.MAX_AGE_MS }?.person
+        ?.let { VisionGeometry.toView(it, viewSize.width.toFloat(), viewSize.height.toFloat()) }
 
     val effects = remember { ArEffects() }
     RunArFrameClock(effects)
-    var fov by remember { mutableStateOf(CameraFov()) }
     val density = LocalDensity.current.density
 
     // Turn game events into visual effects. The shooter's bearing feeds the damage-direction arrow.
@@ -133,7 +159,10 @@ fun GameScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
                 translationY = o.y
             },
     ) {
-        if (cameraGranted) CameraViewfinder(Modifier.fillMaxSize(), onFov = { fov = it })
+        when {
+            useAr -> ArCameraView(vm.ar, Modifier.fillMaxSize())
+            cameraGranted -> CameraViewfinder(Modifier.fillMaxSize(), vm.personDetector, onFov = { fov = it })
+        }
 
         ArOverlay(
             effects = effects,
@@ -145,7 +174,10 @@ fun GameScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
             laserColor = laserColor,
             lowHealth = lowHealth,
             dead = dead,
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier.fillMaxSize().onSizeChanged { viewSize = it },
+            arView = { vm.ar.view.value },
+            myArena = { vm.ar.arenaPose },
+            person = personRect,
         )
 
         Column(Modifier.fillMaxSize().safeDrawingPadding().padding(12.dp)) {
@@ -176,6 +208,12 @@ fun GameScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
                     Spacer(Modifier.width(8.dp))
                     Box(Modifier.size(20.dp).background(myTeam.color(), CircleShape))
                 }
+                Spacer(Modifier.width(8.dp))
+                when {
+                    sync.synced -> Chip("AR synced", Color(0xFF69F0AE))
+                    useAr && !sync.tracking -> Chip("AR: move slowly", Color(0xFFFFC107))
+                    useAr -> Chip("AR: not synced", Color(0xFFFFC107))
+                }
                 Spacer(Modifier.weight(1f))
                 TextButton(onClick = vm::toggleSound) { Text(if (state.soundOn) "Sound on" else "Muted", color = Color.White) }
             }
@@ -192,7 +230,7 @@ fun GameScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
                 Radar(state, myPose, lobby.settings.maxRangeM, effects, Modifier.size(170.dp))
                 Spacer(Modifier.weight(1f))
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    FireButton(enabled = !dead && location != null, color = laserColor, onFire = vm::fire)
+                    FireButton(enabled = !dead && location != null, color = laserColor, onFire = { vm.fire(visionNow()) })
                     TextButton(onClick = vm::leave) { Text("Quit", color = Color.White) }
                 }
             }
@@ -295,24 +333,38 @@ private fun Radar(state: UiState, myPose: Pose?, rangeM: Double, effects: ArEffe
     }
 }
 
-@androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
+/** CameraX viewfinder for phones without ARCore; also feeds frames to person detection. */
+@androidx.annotation.OptIn(ExperimentalCamera2Interop::class, ExperimentalGetImage::class)
 @Composable
-private fun CameraViewfinder(modifier: Modifier, onFov: (CameraFov) -> Unit) {
+private fun CameraViewfinder(modifier: Modifier, detector: PersonDetector, onFov: (CameraFov) -> Unit) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val previewView = remember { PreviewView(context).apply { scaleType = PreviewView.ScaleType.FILL_CENTER } }
     DisposableEffect(lifecycleOwner) {
+        val analysisExecutor = Executors.newSingleThreadExecutor()
         val future = ProcessCameraProvider.getInstance(context)
         future.addListener({
             val provider = future.get()
             val preview = Preview.Builder().build().also { it.surfaceProvider = previewView.surfaceProvider }
+            val analysis = ImageAnalysis.Builder()
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .build()
+                .also { a ->
+                    a.setAnalyzer(analysisExecutor) { proxy ->
+                        val image = proxy.image
+                        if (image == null) proxy.close() else detector.process(image, proxy.imageInfo.rotationDegrees) { proxy.close() }
+                    }
+                }
             runCatching {
                 provider.unbindAll()
-                val camera = provider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview)
+                val camera = provider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
                 cameraFov(Camera2CameraInfo.from(camera.cameraInfo))?.let(onFov)
             }
         }, ContextCompat.getMainExecutor(context))
-        onDispose { runCatching { future.get().unbindAll() } }
+        onDispose {
+            runCatching { future.get().unbindAll() }
+            analysisExecutor.shutdown()
+        }
     }
     AndroidView(factory = { previewView }, modifier = modifier)
 }

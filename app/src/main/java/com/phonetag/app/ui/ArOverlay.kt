@@ -27,11 +27,17 @@ import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.phonetag.app.GameEvent
+import com.phonetag.app.ar.ArView
+import com.phonetag.app.ar.project
+import com.phonetag.app.ar.relativeAngleDeg
+import com.phonetag.app.vision.ViewRect
+import com.phonetag.core.ArenaPose
 import com.phonetag.core.Geo
 import com.phonetag.core.Lobby
 import com.phonetag.core.PlayerSnapshot
 import com.phonetag.core.Pose
 import com.phonetag.core.Team
+import com.phonetag.core.Vec3
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
@@ -70,6 +76,7 @@ class ArEffects {
     )
     private class Indicator(val bearingDeg: Double, val born: Double)
     private class Smoothed(var bearingDeg: Double, var distanceM: Double)
+    private val smoothedArena = HashMap<Int, Vec3>()
     private class Banner(val text: String, val color: Color, val born: Double)
 
     private val particles = ArrayList<Particle>()
@@ -114,6 +121,14 @@ class ArEffects {
         s.bearingDeg = Geo.normalizeDeg(s.bearingDeg + Geo.signedAngleDeg(s.bearingDeg, bearingDeg) * 0.12)
         s.distanceM += (distanceM - s.distanceM) * 0.12
         return s.bearingDeg to s.distanceM
+    }
+
+    /** Arena positions are already precise; light smoothing just hides the 5 Hz update steps. */
+    fun smoothedArenaPosition(id: Int, target: Vec3): Vec3 {
+        val cur = smoothedArena[id]
+        val next = if (cur == null || (cur - target).length() > 5.0) target else cur + (target - cur) * 0.25
+        smoothedArena[id] = next
+        return next
     }
 
     fun onEvent(e: GameEvent, shooterBearingDeg: Double?, density: Float) {
@@ -363,49 +378,95 @@ fun ArOverlay(
     lowHealth: Boolean,
     dead: Boolean,
     modifier: Modifier = Modifier,
+    /** ARCore camera geometry (read every frame); when we and a target share the arena, markers use true 3D positions. */
+    arView: () -> ArView? = { null },
+    /** Our own arena pose, read every frame alongside [arView] so both match. */
+    myArena: () -> ArenaPose? = { null },
+    /** Person found by on-device detection, in view pixels. */
+    person: ViewRect? = null,
 ) {
     val text = rememberTextMeasurer()
     Canvas(modifier) {
         effects.frameNanos // subscribe to the frame clock
+        if (person != null && !dead) drawPersonBox(person)
         if (myPose != null) {
-            // Pixels per unit tangent. PreviewView FILL_CENTER crops, so the larger scale wins.
-            val focal = max(
-                (size.height / 2) / tan(Math.toRadians(fov.longDeg / 2)),
-                (size.width / 2) / tan(Math.toRadians(fov.shortDeg / 2)),
-            ).toFloat()
-            // Draw far players first so near ones are on top.
-            val ordered = players.mapNotNull { p ->
+            val arView = arView()
+            val myPose = myPose.copy(arena = myArena())
+            val focal = arView?.focalPx ?: fov.focalPx(size.width, size.height)
+            // Other players are assumed to be at eye level when we only have GPS: the horizon line.
+            val horizonY = (size.height / 2 + focal * tan(Math.toRadians(myPose.pitchDeg))).toFloat()
+                .coerceIn(size.height * 0.15f, size.height * 0.7f)
+            val margin = 24 * density
+            fun onScreen(o: Offset) = o.x in margin..(size.width - margin) && o.y in 0f..size.height
+            val myArena = myPose.arena?.takeIf { arView != null && it.epoch == arView.epoch }
+            val placed = players.mapNotNull { p ->
                 val pose = p.snap.pose ?: return@mapNotNull null
-                val (bearing, dist) = effects.smoothedPosition(
-                    p.snap.id,
-                    Geo.bearingDeg(myPose.lat, myPose.lon, pose.lat, pose.lon),
-                    Geo.distanceM(myPose.lat, myPose.lon, pose.lat, pose.lon),
-                )
-                Triple(p, bearing, dist)
-            }.sortedByDescending { it.third }
+                val theirArena = pose.arena
+                if (myArena != null && arView != null && theirArena != null && theirArena.epoch == myArena.epoch) {
+                    // Precise: project the tracked 3D position through the AR camera.
+                    val pos = effects.smoothedArenaPosition(p.snap.id, theirArena.position)
+                    val screen = arView.project(pos, size.width, size.height)?.let { (x, y) -> Offset(x, y) }
+                    Placed(p, (pos - myArena.position).length(), screen?.takeIf(::onScreen), arView.relativeAngleDeg(pos), precise = true)
+                } else {
+                    val (bearing, dist) = effects.smoothedPosition(
+                        p.snap.id,
+                        Geo.bearingDeg(myPose.lat, myPose.lon, pose.lat, pose.lon),
+                        Geo.distanceM(myPose.lat, myPose.lon, pose.lat, pose.lon),
+                    )
+                    val rel = Geo.signedAngleDeg(myPose.azimuthDeg, bearing)
+                    val screen = if (abs(rel) < 85) Offset(size.width / 2 + focal * tan(Math.toRadians(rel)).toFloat(), horizonY) else null
+                    Placed(p, dist, screen?.takeIf(::onScreen), rel, precise = false)
+                }
+            }.sortedByDescending { it.distanceM } // far first so near ones draw on top
             val edgeSlots = IntArray(2) // off-screen arrows already drawn on the left / right edge
-            for ((p, bearing, dist) in ordered) {
-                drawPlayerMarker(text, p, bearing, dist, myPose, focal, maxRangeM, p.snap.id == lockedId, effects.t, edgeSlots)
+            for (pl in placed) {
+                drawPlayerMarker(text, pl, horizonY, maxRangeM, pl.player.snap.id == lockedId, effects.t, edgeSlots)
             }
         }
         with(effects) { drawEffects(text, laserColor, lowHealth, dead, lockedId != null, myPose?.azimuthDeg ?: 0.0) }
     }
 }
 
+/** Pixels per unit tangent for a center-cropped (FILL_CENTER) camera preview of this FOV. */
+fun CameraFov.focalPx(width: Float, height: Float): Float = max(
+    (height / 2) / tan(Math.toRadians(longDeg / 2)),
+    (width / 2) / tan(Math.toRadians(shortDeg / 2)),
+).toFloat()
+
+private class Placed(
+    val player: ArPlayer,
+    val distanceM: Double,
+    /** Null when the player is outside the view; then [relDeg] says which side. */
+    val screen: Offset?,
+    val relDeg: Double,
+    /** Position comes from shared-arena camera tracking rather than GPS. */
+    val precise: Boolean,
+)
+
+/** Corner brackets around a person found by the on-device detector. */
+private fun DrawScope.drawPersonBox(r: ViewRect) {
+    val dp = density
+    val l = min(r.width, r.height) * 0.18f
+    val col = Color.White.copy(alpha = 0.55f)
+    for ((x, sx) in listOf(r.left to 1f, r.right to -1f)) for ((y, sy) in listOf(r.top to 1f, r.bottom to -1f)) {
+        drawLine(col, Offset(x, y), Offset(x + sx * l, y), 2 * dp, StrokeCap.Round)
+        drawLine(col, Offset(x, y), Offset(x, y + sy * l), 2 * dp, StrokeCap.Round)
+    }
+}
+
 private fun DrawScope.drawPlayerMarker(
     text: TextMeasurer,
-    p: ArPlayer,
-    bearingDeg: Double,
-    distanceM: Double,
-    me: Pose,
-    focal: Float,
+    placed: Placed,
+    horizonY: Float,
     maxRangeM: Double,
     locked: Boolean,
     time: Double,
     edgeSlots: IntArray,
 ) {
     val dp = density
-    val rel = Geo.signedAngleDeg(me.azimuthDeg, bearingDeg)
+    val p = placed.player
+    val distanceM = placed.distanceM
+    val rel = placed.relDeg
     val color = when {
         !p.snap.alive -> Color.Gray
         p.friendly -> BlueTeam
@@ -418,13 +479,10 @@ private fun DrawScope.drawPlayerMarker(
         inRange -> 1f
         else -> 0.55f
     }
-    // Other players are assumed to be at eye level, so they sit on the horizon line.
-    val horizonY = (size.height / 2 + focal * tan(Math.toRadians(me.pitchDeg))).toFloat()
-        .coerceIn(size.height * 0.15f, size.height * 0.7f)
-    val x = if (abs(rel) < 85) size.width / 2 + focal * tan(Math.toRadians(rel)).toFloat() else Float.NaN
     val margin = 24 * dp
 
-    if (x.isNaN() || x < margin || x > size.width - margin) {
+    val screen = placed.screen
+    if (screen == null) {
         // Off-screen: arrow on the side the player is on.
         val left = rel < 0
         // Stack arrows on the same edge so they never overlap.
@@ -449,7 +507,7 @@ private fun DrawScope.drawPlayerMarker(
     // Marker gets bigger as the player gets closer.
     val scale = (25.0 / distanceM.coerceAtLeast(1.0)).coerceIn(0.55, 2.0).toFloat()
     val s = 16 * dp * scale
-    val pos = Offset(x, horizonY)
+    val pos = screen
 
     if (!p.snap.alive) {
         drawLine(color.copy(alpha = alpha), Offset(pos.x - s, pos.y - s), Offset(pos.x + s, pos.y + s), 3 * dp)
@@ -481,7 +539,8 @@ private fun DrawScope.drawPlayerMarker(
 
     // Name, distance and health bar above the marker.
     val label = text.measure(
-        "${p.name}  ${distanceM.toInt()} m",
+        // "AR" = position from shared camera tracking (cm-level), otherwise it's GPS (metres).
+        "${p.name}  ${if (distanceM < 10) "%.1f".format(distanceM) else distanceM.toInt()} m${if (placed.precise) "  AR" else ""}",
         TextStyle(color = Color.White.copy(alpha = alpha), fontSize = 12.sp, fontWeight = FontWeight.Bold),
     )
     val top = pos.y - s * 2.2f - label.size.height - 10 * dp

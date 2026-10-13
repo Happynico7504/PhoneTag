@@ -8,6 +8,8 @@ import android.os.Vibrator
 import android.os.VibratorManager
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.phonetag.app.ar.ArEngine
+import com.phonetag.app.ar.ArSupport
 import com.phonetag.app.net.GroupInfo
 import com.phonetag.app.net.NearbyGame
 import com.phonetag.app.net.WifiDirect
@@ -16,6 +18,8 @@ import com.phonetag.app.sensors.LocationTracker
 import com.phonetag.app.sensors.OrientationTracker
 import com.phonetag.app.sfx.Sfx
 import com.phonetag.app.sfx.SoundFx
+import com.phonetag.app.vision.PersonDetector
+import com.phonetag.core.ArenaInfo
 import com.phonetag.core.ClientMessage
 import com.phonetag.core.GameClient
 import com.phonetag.core.GameServer
@@ -26,6 +30,7 @@ import com.phonetag.core.Pose
 import com.phonetag.core.Protocol
 import com.phonetag.core.ServerMessage
 import com.phonetag.core.Team
+import com.phonetag.core.VisionHint
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -69,11 +74,18 @@ data class UiState(
     val onlineLobbies: List<LobbySummary> = emptyList(),
     val feed: List<FeedItem> = emptyList(),
     val soundOn: Boolean = true,
+    /** Full-screen AR view for syncing this phone to the shared arena. */
+    val showArenaSync: Boolean = false,
+    /** Showing our sync marker so other players can scan it. */
+    val showingMarker: Boolean = false,
 ) {
     val me get() = snapshot?.players?.firstOrNull { it.id == myId }
     val isHost get() = lobby?.hostId == myId
     fun nameOf(id: Int) = lobby?.players?.firstOrNull { it.id == id }?.name ?: "#$id"
     fun teamOf(id: Int) = lobby?.players?.firstOrNull { it.id == id }?.team ?: Team.NONE
+    /** Whether a player is currently reporting a pose in the lobby's arena. */
+    fun isSynced(id: Int) = lobby != null && lobby.arena.epoch > 0 &&
+        snapshot?.players?.firstOrNull { it.id == id }?.pose?.arena?.epoch == lobby.arena.epoch
 }
 
 /**
@@ -101,6 +113,12 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
     val aim: StateFlow<Aim> = orientation.aim
     val location = locations.location
 
+    /** ARCore camera tracking + shared arena; idle on phones without ARCore. */
+    val ar = ArEngine(app)
+    /** On-device person detection, fed by ARCore or CameraX frames. */
+    val personDetector = PersonDetector()
+    private var beaconSent = false
+
     private var localServer: GameServer? = null
     private var client: GameClient? = null
     private var poseJob: Job? = null
@@ -123,6 +141,19 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
     fun onPermissionsGranted() {
         locations.start()
         orientation.start()
+        ar.imageSink = { image, rotation ->
+            personDetector.process(image, rotation) {
+                image.close()
+                ar.imageDone()
+            }
+        }
+        viewModelScope.launch {
+            // Tell the lobby once we know whether this phone can do AR.
+            ar.support.collect {
+                // Only once we're in a lobby: before the Welcome the server rejects anything but Hello.
+                if (it != ArSupport.CHECKING && _state.value.myId != 0) client?.send(ClientMessage.SetCapabilities(it == ArSupport.SUPPORTED))
+            }
+        }
         viewModelScope.launch {
             locations.location.collect { loc -> loc?.let(orientation::updateDeclination) }
         }
@@ -131,7 +162,7 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
     fun currentPose(): Pose? {
         val loc = locations.location.value ?: return null
         val a = orientation.aim.value
-        return Pose(loc.latitude, loc.longitude, loc.accuracy.toDouble().coerceAtLeast(1.0), a.azimuthDeg, a.pitchDeg)
+        return Pose(loc.latitude, loc.longitude, loc.accuracy.toDouble().coerceAtLeast(1.0), a.azimuthDeg, a.pitchDeg, ar.arenaPose)
     }
 
     // ------------------------------------------------------------------ navigation
@@ -160,6 +191,7 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun back() {
+        if (_state.value.showArenaSync) return closeArenaSync()
         when (_state.value.screen) {
             Screen.NEARBY -> wifiDirect.stopDiscovery()
             Screen.SESSION, Screen.CONNECTING -> return leave()
@@ -280,6 +312,7 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
             while (isActive) {
                 val c = client ?: break
                 currentPose()?.let { c.send(ClientMessage.PoseUpdate(it)) }
+                sendBeacon(c)
                 if (tick++ % 25 == 0) c.send(ClientMessage.Ping(System.currentTimeMillis()))
                 delay(200)
             }
@@ -289,8 +322,13 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
     private fun onServerMessage(msg: ServerMessage) {
         val now = System.currentTimeMillis()
         when (msg) {
-            is ServerMessage.Welcome -> _state.update { it.copy(myId = msg.playerId, screen = Screen.SESSION, status = null) }
+            is ServerMessage.Welcome -> {
+                ar.myId = msg.playerId
+                _state.update { it.copy(myId = msg.playerId, screen = Screen.SESSION, status = null) }
+                if (ar.support.value != ArSupport.CHECKING) client?.send(ClientMessage.SetCapabilities(ar.support.value == ArSupport.SUPPORTED))
+            }
             is ServerMessage.LobbyState -> {
+                ar.arena = msg.arena
                 val starting = _state.value.lobby?.phase != Phase.RUNNING && msg.phase == Phase.RUNNING
                 _state.update { s ->
                     s.copy(
@@ -298,6 +336,9 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
                         results = if (starting) null else s.results,
                         feed = if (starting) emptyList() else s.feed,
                         snapshot = if (starting) null else s.snapshot,
+                        // The game view takes over the AR camera (and keeps the arena sync).
+                        showArenaSync = if (starting) false else s.showArenaSync,
+                        showingMarker = if (starting) false else s.showingMarker,
                     )
                 }
                 if (starting) {
@@ -306,6 +347,7 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
             is ServerMessage.Snapshot -> {
+                ar.beacons = msg.players.filter { it.id != _state.value.myId }.mapNotNull { p -> p.beacon?.let { p.id to it } }.toMap()
                 val wasDead = _state.value.me?.alive == false
                 _state.update { it.copy(snapshot = msg) }
                 if (wasDead && _state.value.me?.alive == true) {
@@ -345,7 +387,7 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
 
     // ------------------------------------------------------------------ actions
 
-    fun fire() {
+    fun fire(vision: VisionHint? = null) {
         val now = System.currentTimeMillis()
         val s = _state.value
         val cooldown = s.lobby?.settings?.fireCooldownMs ?: 350
@@ -355,7 +397,32 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
         // Tiny pitch variation keeps rapid fire from sounding robotic.
         sfx.play(Sfx.LASER, rate = 0.94f + (shotSeq % 5) * 0.03f)
         _events.tryEmit(GameEvent.Fired)
-        client?.send(ClientMessage.Shoot(++shotSeq, pose))
+        client?.send(ClientMessage.Shoot(++shotSeq, pose, vision))
+    }
+
+    // ------------------------------------------------------------------ arena sync
+
+    fun openArenaSync() = _state.update { it.copy(showArenaSync = true) }
+
+    fun closeArenaSync() = _state.update { it.copy(showArenaSync = false, showingMarker = false) }
+
+    fun toggleMarker() = _state.update { it.copy(showingMarker = !it.showingMarker) }
+
+    /** Host only: start a new arena defined by [referenceId]'s phone; everyone re-syncs. */
+    fun resetArena(referenceId: Int) = client?.send(ClientMessage.ResetArena(referenceId))
+
+    /** While our marker is on screen and we're synced and holding still, broadcast its arena pose. */
+    private fun sendBeacon(c: GameClient) {
+        val screen = ar.screenInArena
+        val epoch = ar.arena.epoch
+        val active = _state.value.showingMarker && ar.sync.value.steady && screen != null
+        if (active) {
+            c.send(ClientMessage.SetBeacon(epoch, screen))
+            beaconSent = true
+        } else if (beaconSent) {
+            c.send(ClientMessage.SetBeacon(epoch, null))
+            beaconSent = false
+        }
     }
 
     /** UI cue when an enemy enters the crosshair. */
@@ -388,6 +455,10 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
             server?.stop()
         }.start()
         if (_state.value.transport != Transport.ONLINE) wifiDirect.leave()
+        ar.arena = ArenaInfo()
+        ar.myId = 0
+        ar.beacons = emptyMap()
+        beaconSent = false
         _state.update { UiState(playerName = it.playerName, serverAddress = it.serverAddress, error = it.error, soundOn = it.soundOn) }
     }
 
@@ -406,5 +477,7 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
         locations.stop()
         orientation.stop()
         sfx.release()
+        ar.close()
+        personDetector.close()
     }
 }

@@ -10,6 +10,8 @@ coreKtx = "1.15.0"
 playServicesLocation = "21.3.0"
 camerax = "1.4.1"
 junit = "4.13.2"
+arcore = "1.46.0"
+mlkitPose = "18.0.0-beta5"
 
 [libraries]
 kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "serialization" }
@@ -27,6 +29,8 @@ camerax-camera2 = { module = "androidx.camera:camera-camera2", version.ref = "ca
 camerax-lifecycle = { module = "androidx.camera:camera-lifecycle", version.ref = "camerax" }
 camerax-view = { module = "androidx.camera:camera-view", version.ref = "camerax" }
 junit = { module = "junit:junit", version.ref = "junit" }
+arcore = { module = "com.google.ar:core", version.ref = "arcore" }
+mlkit-pose-detection = { module = "com.google.mlkit:pose-detection", version.ref = "mlkitPose" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

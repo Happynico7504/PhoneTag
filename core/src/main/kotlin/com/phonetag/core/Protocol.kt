@@ -12,7 +12,7 @@ import kotlinx.serialization.json.Json
  * or on a dedicated machine on the internet, so the client never needs to care which.
  */
 object Protocol {
-    const val VERSION = 1
+    const val VERSION = 2
 
     /** Hard cap on players per lobby. Never configurable above this. */
     const val MAX_PLAYERS_PER_LOBBY = 16
@@ -68,7 +68,20 @@ data class GameSettings(
     )
 }
 
-/** A position/orientation fix reported by a phone. Bearings are degrees from true north. */
+@Serializable
+enum class HitMethod {
+    /** Both players are synced to the shared AR arena: precise 3D ray cast. */
+    ARENA,
+    /** GPS + compass cone. */
+    GPS,
+    /** GPS + compass cone, widened because the shooter's camera saw a person in the crosshair. */
+    GPS_VISION,
+}
+
+/**
+ * A position/orientation fix reported by a phone. Bearings are degrees from true north.
+ * [arena] is present when the phone is synced to the lobby's shared AR arena (camera tracking).
+ */
 @Serializable
 data class Pose(
     val lat: Double,
@@ -76,7 +89,25 @@ data class Pose(
     val accuracyM: Double,
     val azimuthDeg: Double,
     val pitchDeg: Double = 0.0,
+    val arena: ArenaPose? = null,
 )
+
+/** Camera position and viewing direction in the shared arena frame (metres, +Y up). */
+@Serializable
+data class ArenaPose(val epoch: Int, val position: Vec3, val forward: Vec3)
+
+/** What the shooter's camera saw when firing (on-device person detection). */
+@Serializable
+data class VisionHint(
+    /** True if a person's body box covered the crosshair, false if the camera saw nobody there. */
+    val personInCrosshair: Boolean,
+    /** Distance estimated from the person's apparent height, if the whole body was visible. */
+    val estDistanceM: Double? = null,
+)
+
+/** The lobby's shared AR frame. Bumping [epoch] invalidates every device's sync. */
+@Serializable
+data class ArenaInfo(val epoch: Int = 0, val referenceId: Int = 0)
 
 @Serializable
 data class PlayerInfo(
@@ -84,6 +115,7 @@ data class PlayerInfo(
     val name: String,
     val team: Team,
     val isHost: Boolean,
+    val arCapable: Boolean = false,
 )
 
 @Serializable
@@ -95,6 +127,8 @@ data class PlayerSnapshot(
     val respawnInMs: Long,
     val score: Int,
     val deaths: Int,
+    /** Pose of the sync marker on this player's screen (arena frame), while they show it. */
+    val beacon: Rigid? = null,
 )
 
 @Serializable
@@ -142,7 +176,19 @@ sealed class ClientMessage {
     data class PoseUpdate(val pose: Pose) : ClientMessage()
 
     @Serializable @SerialName("shoot")
-    data class Shoot(val seq: Int, val pose: Pose) : ClientMessage()
+    data class Shoot(val seq: Int, val pose: Pose, val vision: VisionHint? = null) : ClientMessage()
+
+    /** Tells the server whether this phone supports ARCore camera tracking. */
+    @Serializable @SerialName("caps")
+    data class SetCapabilities(val ar: Boolean) : ClientMessage()
+
+    /** Start (non-null [screen]) or stop showing this phone's sync marker. */
+    @Serializable @SerialName("beacon")
+    data class SetBeacon(val epoch: Int, val screen: Rigid?) : ClientMessage()
+
+    /** Host only: start a fresh arena whose frame is defined by [referenceId]'s phone. */
+    @Serializable @SerialName("arena")
+    data class ResetArena(val referenceId: Int) : ClientMessage()
 
     @Serializable @SerialName("ping")
     data class Ping(val clientTimeMs: Long) : ClientMessage()
@@ -173,6 +219,7 @@ sealed class ServerMessage {
         val settings: GameSettings,
         val players: List<PlayerInfo>,
         val maxPlayers: Int = Protocol.MAX_PLAYERS_PER_LOBBY,
+        val arena: ArenaInfo = ArenaInfo(),
     ) : ServerMessage()
 
     /** Periodic world state: everyone's tracked position, health and score. */
@@ -184,7 +231,13 @@ sealed class ServerMessage {
 
     /** Sent to the shooter for every shot so the client can show hit/miss feedback. */
     @Serializable @SerialName("shot")
-    data class ShotResult(val seq: Int, val hitPlayerId: Int?, val distanceM: Double?, val eliminated: Boolean) : ServerMessage()
+    data class ShotResult(
+        val seq: Int,
+        val hitPlayerId: Int?,
+        val distanceM: Double?,
+        val eliminated: Boolean,
+        val method: HitMethod? = null,
+    ) : ServerMessage()
 
     /** Sent to the player who got hit. */
     @Serializable @SerialName("hit")

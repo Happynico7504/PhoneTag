@@ -51,6 +51,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.phonetag.app.GameViewModel
 import com.phonetag.app.Screen
 import com.phonetag.app.Transport
+import com.phonetag.app.ar.ArSupport
 import com.phonetag.app.UiState
 import com.phonetag.core.GameMode
 import com.phonetag.core.Phase
@@ -77,6 +78,7 @@ fun PhoneTagApp(vm: GameViewModel, cameraGranted: Boolean, nearbyGranted: Boolea
             Screen.CONNECTING -> ConnectingScreen(state.status ?: "Connecting…", onCancel = vm::leave)
             Screen.SESSION -> when {
                 state.lobby?.phase == Phase.RUNNING -> GameScreen(vm, state, cameraGranted)
+                state.showArenaSync -> ArenaSyncScreen(vm, state, cameraGranted)
                 state.results != null && state.lobby?.phase == Phase.ENDED -> ResultsScreen(vm, state, state.results!!)
                 else -> LobbyScreen(vm, state)
             }
@@ -294,10 +296,20 @@ private fun LobbyScreen(vm: GameViewModel, state: UiState) {
                     Box(Modifier.size(12.dp).background(if (settings.mode == GameMode.TEAMS) p.team.color() else Color.Gray, CircleShape))
                     Spacer(Modifier.width(10.dp))
                     Text(p.name + if (p.id == state.myId) " (you)" else "", modifier = Modifier.weight(1f))
+                    // AR status: capable, synced to the shared arena, or the arena's reference phone.
+                    val arTag = when {
+                        p.id == lobby.arena.referenceId && state.isSynced(p.id) -> "AR ref" to Color(0xFF69F0AE)
+                        state.isSynced(p.id) -> "AR synced" to Color(0xFF69F0AE)
+                        p.arCapable -> "AR" to Color.Gray
+                        else -> null
+                    }
+                    arTag?.let { (t, c) -> Text(t, color = c, fontSize = 12.sp, modifier = Modifier.padding(end = 8.dp)) }
                     if (p.isHost) Text("HOST", color = MaterialTheme.colorScheme.primary, fontSize = 12.sp)
                 }
             }
         }
+
+        ArenaRow(vm, state)
 
         if (state.isHost) {
             Text("Settings", style = MaterialTheme.typography.titleMedium)
@@ -317,6 +329,37 @@ private fun LobbyScreen(vm: GameViewModel, state: UiState) {
             Hint("Waiting for the host to start. ${settings.mode.label()}, ${settings.matchDurationSec / 60} min, ${settings.maxRangeM.toInt()} m range.")
         }
         OutlinedButton(onClick = vm::leave, modifier = Modifier.fillMaxWidth()) { Text("Leave") }
+    }
+}
+
+/** AR camera tracking status for this phone, plus the host's choice of arena reference. */
+@Composable
+private fun ArenaRow(vm: GameViewModel, state: UiState) {
+    val lobby = state.lobby ?: return
+    val support by vm.ar.support.collectAsStateWithLifecycle()
+    val sync by vm.ar.sync.collectAsStateWithLifecycle()
+    if (support == ArSupport.SUPPORTED) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("AR camera tracking", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    when {
+                        lobby.arena.epoch == 0 -> "Arena not started"
+                        sync.synced -> "Synced: precise 3D hits with other synced players"
+                        else -> "Not synced: sync for precise 3D hits"
+                    },
+                    color = if (sync.synced) Color(0xFF69F0AE) else Color.Gray, fontSize = 13.sp,
+                )
+            }
+            OutlinedButton(onClick = vm::openArenaSync, enabled = lobby.arena.epoch > 0) { Text(if (sync.synced) "Share sync" else "Sync") }
+        }
+    } else if (support == ArSupport.UNSUPPORTED) {
+        Hint("No AR on this phone: you'll be tracked by GPS + compass, with camera person detection.")
+    }
+    val capable = lobby.players.filter { it.arCapable }
+    if (state.isHost && capable.isNotEmpty()) {
+        // Picking a reference starts a fresh arena; everyone else re-syncs from it.
+        ChoiceRow("Arena", capable.map { it.id to it.name }, lobby.arena.referenceId) { if (it != lobby.arena.referenceId) vm.resetArena(it) }
     }
 }
 

@@ -24,6 +24,8 @@
     <uses-feature android:name="android.hardware.location.gps" android:required="true" />
     <uses-feature android:name="android.hardware.sensor.compass" android:required="true" />
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
+    <!-- ARCore camera tracking is used when available; other phones fall back to GPS + compass. -->
+    <uses-feature android:name="android.hardware.camera.ar" android:required="false" />
 
     <application
         android:allowBackup="false"
@@ -31,6 +33,7 @@
         android:label="@string/app_name"
         android:supportsRtl="true"
         android:theme="@style/Theme.PhoneTag">
+        <meta-data android:name="com.google.ar.core" android:value="optional" />
         <activity
             android:name=".MainActivity"
             android:exported="true"

@@ -38,6 +38,35 @@ newline-delimited JSON protocol over TCP. The host phone just runs the server in
   350 ms fire cooldown, 60 m range by default. The server enforces all of them. Free-for-all
   or Red vs Blue teams (no friendly fire). Matches last 5, 10 or 15 min.
 
+### Camera tracking & shared AR arena
+On phones with ARCore, the camera also tracks the phone in 3D, accurate to a few centimetres.
+Phones then **sync a shared coordinate frame (the "arena") with each other, offline**, with no
+cloud anchors and no internet:
+
+1. The lobby names a **reference phone**: the first AR-capable phone by default, and the host
+   can pick another. Its ARCore world at the moment it starts tracking defines the arena.
+2. A synced player opens **AR sync → Show my marker**. Their screen shows a generated image
+   target at an exact physical size (5 cm) and keeps broadcasting the screen's pose in arena
+   coordinates through the game server.
+3. Another player points their camera at that screen from 20–40 cm away. ARCore measures the
+   marker. Since `marker_in_my_world = arena_to_my_world × screen_in_arena`, the phone solves
+   for `arena_to_my_world`. It averages 15 consistent samples, keeps only yaw and translation
+   (both worlds are gravity-aligned), and stores the result as an ARCore anchor that keeps
+   refining. Any synced phone can sync the next one.
+
+How hits are decided (`core/.../HitResolver.kt`):
+
+| Shooter / target | Method |
+|---|---|
+| Both synced to the same arena epoch | **3D ray cast** from the shooter's camera against a body-sized capsule around the target's phone. Tolerance is 0.5 m plus 2 cm per metre of distance. |
+| Otherwise | **GPS + compass cone**, as before |
+| ...plus on-device **person detection** (ML Kit pose detection, offline) | A person under the crosshair at a plausible distance **widens** the GPS cone. A clearly empty crosshair within 20 m **narrows** it, which also makes shooting through walls harder. |
+
+AR markers in the view use the true 3D positions of synced players ("AR" in their label).
+The detected person gets corner brackets. The host can restart the arena at any time,
+which starts a new epoch and everyone re-syncs. Phones without ARCore still take part using
+CameraX, GPS, compass and person detection.
+
 ### AR view & sound
 - **Player markers in the camera image.** Each player's GPS bearing is projected into the viewfinder
   using the real camera's field of view (read from the lens focal length and sensor size).
@@ -55,9 +84,13 @@ newline-delimited JSON protocol over TCP. The host phone just runs the server in
   You can mute them from the in-game HUD.
 
 ### Limitations to know about
-- **GPS is the precision limit.** Phone GPS is typically good to ±3–10 m outdoors and much
+- **Without AR sync, GPS is the precision limit.** Phone GPS is typically good to ±3–10 m outdoors and much
   worse indoors. Play outside with open sky, and spread out more than a few metres. The app
   shows your current GPS accuracy, and the hit cone widens to compensate.
+- **AR sync accuracy** depends mostly on how still both phones are while scanning. A 1° heading
+  error moves a target 50 cm at 30 m. If the arena drifts after a long match, the host can
+  restart it. Pausing the camera, for example by leaving the app, can make ARCore lose its map;
+  re-sync if the lobby stops showing you as "AR synced".
 - **Compass calibration matters.** If the app says the compass is unreliable, wave the phone in a figure 8.
 - **Wi-Fi Direct client limits vary by phone.** The protocol allows 16 players, but some
   phones only accept about 8 clients in a Wi-Fi Direct group. If people can't join, use the
