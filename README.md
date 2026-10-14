@@ -226,8 +226,13 @@ docker build -f server/Dockerfile -t phonetag-server .
 docker run -p 47474:47474 phonetag-server
 ```
 
-Open TCP port 47474 in your firewall. In the app, go to **Play online**, enter `host:47474`,
-then either create a lobby and share its 5-letter code, or join from the open-lobby list.
+Open TCP port 47474 in your firewall. In the app, go to **Play online**, choose **Custom server**
+and enter `host:47474`. Then either create a lobby and share its 5-letter code, or join from the
+open-lobby list.
+
+The **Official server** choice, selected by default, connects to the public instance at
+`phonetag.nicochristmann.net:47474` without typing anything. Your custom address is kept
+separately, so you can switch back and forth.
 
 ## Playing
 

@@ -79,7 +79,10 @@ sealed interface GameEvent {
 data class UiState(
     val screen: Screen = Screen.HOME,
     val playerName: String = "",
+    /** The user's own server ("Custom server"); kept separately from the official one. */
     val serverAddress: String = "",
+    /** Online play goes to the official PhoneTag server instead of [serverAddress]. */
+    val useOfficialServer: Boolean = true,
     val status: String? = null,
     val error: String? = null,
     val transport: Transport? = null,
@@ -125,6 +128,7 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
         UiState(
             playerName = prefs.getString("name", null) ?: Build.MODEL.take(16),
             serverAddress = prefs.getString("server", "") ?: "",
+            useOfficialServer = prefs.getBoolean("official", true),
             soundOn = prefs.getBoolean("sound", true),
             micOn = prefs.getBoolean("mic", true),
         )
@@ -220,7 +224,19 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
 
     fun openOnline() {
         _state.update { it.copy(screen = Screen.ONLINE, error = null, onlineLobbies = emptyList()) }
+        if (_state.value.useOfficialServer) refreshOnlineLobbies()
     }
+
+    /** Switches online play between the official server and the custom server field. */
+    fun useOfficialServer(official: Boolean) {
+        prefs.edit().putBoolean("official", official).apply()
+        _state.update { it.copy(useOfficialServer = official, onlineLobbies = emptyList()) }
+        if (official) refreshOnlineLobbies()
+    }
+
+    /** Address online play currently targets, or null if a custom server is selected but not entered. */
+    private fun activeServer(): Pair<String, Int>? =
+        if (_state.value.useOfficialServer) parseAddress(OFFICIAL_SERVER) else parseAddress(_state.value.serverAddress)
 
     fun back() {
         if (_state.value.showArenaSync) return closeArenaSync()
@@ -289,7 +305,7 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun refreshOnlineLobbies() {
-        val (host, port) = parseAddress(_state.value.serverAddress) ?: return fail("Enter a server address like play.example.com:47474")
+        val (host, port) = activeServer() ?: return fail("Enter a server address like play.example.com:47474")
         viewModelScope.launch(Dispatchers.IO) {
             val probe = GameClient(
                 onMessage = { msg -> if (msg is ServerMessage.LobbyList) _state.update { it.copy(onlineLobbies = msg.lobbies) } },
@@ -305,7 +321,7 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun online(hello: ClientMessage.Hello) {
-        val (host, port) = parseAddress(_state.value.serverAddress) ?: return fail("Enter a server address like play.example.com:47474")
+        val (host, port) = activeServer() ?: return fail("Enter a server address like play.example.com:47474")
         connecting(Transport.ONLINE, "Connecting to $host:$port…")
         connectTo(host, port, hello)
     }
@@ -617,7 +633,8 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
         wallsSentVersion = -1
         _state.update {
             UiState(
-                playerName = it.playerName, serverAddress = it.serverAddress, error = it.error, soundOn = it.soundOn,
+                playerName = it.playerName, serverAddress = it.serverAddress, useOfficialServer = it.useOfficialServer,
+                error = it.error, soundOn = it.soundOn,
                 torchMode = it.torchMode, micOn = it.micOn, micAllowed = it.micAllowed,
             )
         }
@@ -630,6 +647,11 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun vibrate(ms: Long) {
         vibrator?.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE))
+    }
+
+    companion object {
+        /** The public PhoneTag server, offered as a one-tap choice in online play. */
+        const val OFFICIAL_SERVER = "phonetag.nicochristmann.net:47474"
     }
 
     override fun onCleared() {

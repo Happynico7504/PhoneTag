@@ -1,6 +1,7 @@
 package com.phonetag.app.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -221,16 +222,37 @@ private fun OnlineScreen(vm: GameViewModel, state: UiState) {
             TextButton(onClick = vm::back) { Text("Back") }
             Text("Online play", style = MaterialTheme.typography.titleLarge)
         }
-        OutlinedTextField(
-            value = state.serverAddress,
-            onValueChange = vm::setServerAddress,
-            label = { Text("Server (host:port)") },
-            placeholder = { Text("play.example.com:${Protocol.DEFAULT_PORT}") },
-            singleLine = true,
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-            modifier = Modifier.fillMaxWidth(),
-        )
-        Button(onClick = vm::createOnline, enabled = state.serverAddress.isNotBlank(), modifier = Modifier.fillMaxWidth()) {
+        // Server choice: the official instance (one tap) or your own, kept in a separate field.
+        val official = state.useOfficialServer
+        val serverReady = official || state.serverAddress.isNotBlank()
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            ServerChoice(
+                title = "Official server",
+                detail = GameViewModel.OFFICIAL_SERVER.substringBefore(':'),
+                selected = official,
+                onClick = { vm.useOfficialServer(true) },
+                modifier = Modifier.weight(1f),
+            )
+            ServerChoice(
+                title = "Custom server",
+                detail = state.serverAddress.ifBlank { "your own host" },
+                selected = !official,
+                onClick = { vm.useOfficialServer(false) },
+                modifier = Modifier.weight(1f),
+            )
+        }
+        if (!official) {
+            OutlinedTextField(
+                value = state.serverAddress,
+                onValueChange = vm::setServerAddress,
+                label = { Text("Custom server (host:port)") },
+                placeholder = { Text("play.example.com:${Protocol.DEFAULT_PORT}") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+        Button(onClick = vm::createOnline, enabled = serverReady, modifier = Modifier.fillMaxWidth()) {
             Text("Create new lobby")
         }
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -243,12 +265,12 @@ private fun OnlineScreen(vm: GameViewModel, state: UiState) {
                 modifier = Modifier.weight(1f),
             )
             Spacer(Modifier.width(8.dp))
-            OutlinedButton(onClick = { vm.joinOnline(code) }, enabled = code.length == 5 && state.serverAddress.isNotBlank()) { Text("Join") }
+            OutlinedButton(onClick = { vm.joinOnline(code) }, enabled = code.length == 5 && serverReady) { Text("Join") }
         }
         HorizontalDivider()
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("Open lobbies", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
-            TextButton(onClick = vm::refreshOnlineLobbies, enabled = state.serverAddress.isNotBlank()) { Text("Refresh") }
+            TextButton(onClick = vm::refreshOnlineLobbies, enabled = serverReady) { Text("Refresh") }
         }
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             items(state.onlineLobbies, key = { it.code }) { l ->
@@ -264,6 +286,21 @@ private fun OnlineScreen(vm: GameViewModel, state: UiState) {
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun ServerChoice(title: String, detail: String, selected: Boolean, onClick: () -> Unit, modifier: Modifier) {
+    val border = if (selected) MaterialTheme.colorScheme.primary else Color(0x33FFFFFF)
+    Column(
+        modifier
+            .background(if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.15f) else Color(0x14FFFFFF), RoundedCornerShape(12.dp))
+            .border(if (selected) 2.dp else 1.dp, border, RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick)
+            .padding(12.dp),
+    ) {
+        Text(title, fontWeight = FontWeight.Bold)
+        Text(detail, color = Color.Gray, fontSize = 12.sp, maxLines = 1)
     }
 }
 
