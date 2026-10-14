@@ -1,0 +1,32 @@
+# systemd unit for a native (non-Docker) PhoneTag server.
+#
+# Install:
+#   sudo useradd --system --no-create-home phonetag
+#   sudo server/update.sh --native /opt/phonetag-server --no-pull   # first install
+#   sudo cp server/phonetag-server.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now phonetag-server
+#
+# Update later with:  sudo server/update.sh --native
+[Unit]
+Description=PhoneTag game server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=phonetag
+# Needs Java 17+ on PATH (or set JAVA_HOME below).
+#Environment=JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+ExecStart=/opt/phonetag-server/bin/phonetag-server --port 47474
+Restart=on-failure
+RestartSec=3
+
+# Hardening: the server only needs the network.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+
+[Install]
+WantedBy=multi-user.target
