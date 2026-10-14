@@ -38,6 +38,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.graphicsLayer
@@ -62,6 +63,7 @@ import com.phonetag.core.HitResolver
 import com.phonetag.core.Lobby
 import com.phonetag.core.Pose
 import com.phonetag.core.Vec3
+import com.phonetag.core.VoiceRouter
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.atan2
@@ -150,7 +152,9 @@ fun GameScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
 
         ArOverlay(
             effects = effects,
-            players = others.map { ArPlayer(it, state.nameOf(it.id), state.teamOf(it.id), teams && state.teamOf(it.id) == myTeam) },
+            players = others.map {
+                ArPlayer(it, state.nameOf(it.id), state.teamOf(it.id), teams && state.teamOf(it.id) == myTeam, talking = it.id in state.talking)
+            },
             myPose = myPose,
             fov = fov,
             maxRangeM = lobby.settings.maxRangeM,
@@ -201,8 +205,8 @@ fun GameScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
                     else -> Chip("AR: not synced", Color(0xFFFFC107))
                 }
                 Spacer(Modifier.weight(1f))
-                TorchButton(state)
-                { vm.cycleTorchMode() }
+                TorchButton(state) { vm.cycleTorchMode() }
+                MicButton(state, vm::toggleMic)
                 TextButton(onClick = vm::toggleSound) { Text(if (state.soundOn) "Sound on" else "Muted", color = Color.White) }
             }
             if (!aim.compassReliable) {
@@ -218,6 +222,7 @@ fun GameScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
                     modifier = Modifier.background(Color(0x99000000), RoundedCornerShape(6.dp)).padding(6.dp),
                 )
             }
+            RadioStatus(state)
             state.feed.forEach { Text(it.text, color = Color.White, fontSize = 13.sp) }
 
             Spacer(Modifier.weight(1f))
@@ -310,6 +315,12 @@ private fun Radar(state: UiState, myPose: Pose?, rangeM: Double, effects: ArEffe
         val r = size.minDimension / 2
         drawCircle(Color(0x5539FF14), r, c, style = Stroke(1.dp.toPx()))
         drawCircle(Color(0x3339FF14), r / 2, c, style = Stroke(1.dp.toPx()))
+        // Voice ring: players inside it hear you directly, so the radio is muted for them.
+        val voiceR = (VoiceRouter.RANGE_M / rangeM).toFloat().coerceAtMost(1f) * r
+        drawCircle(
+            Color(0x88FFD54F), voiceR, c,
+            style = Stroke(1.dp.toPx(), pathEffect = PathEffect.dashPathEffect(floatArrayOf(4.dp.toPx(), 4.dp.toPx()))),
+        )
         // Rotating sweep with a fading trail.
         val sweep = (effects.t * 120 % 360).toFloat()
         rotate(sweep, c) {
@@ -349,6 +360,35 @@ private fun Radar(state: UiState, myPose: Pose?, rangeM: Double, effects: ArEffe
             drawCircle(color, if (d > rangeM) 3.dp.toPx() else 6.dp.toPx(), pos)
         }
     }
+}
+
+/** Mic switch for proximity voice chat; highlighted while we're transmitting. */
+@Composable
+fun MicButton(state: UiState, onClick: () -> Unit) {
+    val label = when {
+        !state.micAllowed -> "Mic: no permission"
+        !state.micOn -> "Mic off"
+        state.meTalking -> "Mic: on air"
+        else -> "Mic on"
+    }
+    TextButton(onClick = onClick, enabled = state.micAllowed) {
+        Text(label, color = if (state.meTalking) Color(0xFF69F0AE) else Color.White)
+    }
+}
+
+/**
+ * Who you can talk to over the radio. Only players at least 10 m away are linked; closer ones
+ * can hear you directly, and muting them avoids speaker-to-mic feedback.
+ */
+@Composable
+fun RadioStatus(state: UiState) {
+    val names = state.radioPartners.map { id -> (if (id in state.talking) "🔊 " else "") + state.nameOf(id) }
+    Text(
+        if (names.isEmpty()) "Radio: nobody beyond ${VoiceRouter.RANGE_M.toInt()} m" else "Radio: ${names.joinToString()}",
+        color = if (state.talking.isNotEmpty()) Color(0xFF69F0AE) else Color.LightGray,
+        fontSize = 13.sp,
+        modifier = Modifier.background(Color(0x66000000), RoundedCornerShape(6.dp)).padding(horizontal = 8.dp, vertical = 2.dp),
+    )
 }
 
 /** Flashlight mode (Auto / On / Off), with whether it's lit right now. Each phone decides alone. */

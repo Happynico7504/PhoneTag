@@ -22,6 +22,7 @@ import com.phonetag.app.sensors.OrientationTracker
 import com.phonetag.app.sfx.Sfx
 import com.phonetag.app.sfx.SoundFx
 import com.phonetag.app.vision.PersonDetector
+import com.phonetag.app.voice.VoiceChat
 import com.phonetag.core.ArenaInfo
 import com.phonetag.core.ClientMessage
 import com.phonetag.core.GameClient
@@ -48,6 +49,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.Base64
 
 enum class Screen { HOME, NEARBY, ONLINE, CONNECTING, SESSION }
 
@@ -93,6 +95,12 @@ data class UiState(
     val walls: List<Wall> = emptyList(),
     val torchMode: TorchMode = TorchMode.AUTO,
     val torchOn: Boolean = false,
+    /** Proximity voice chat: our mic switch, who's in radio range (≥ 10 m), who's talking. */
+    val micOn: Boolean = true,
+    val micAllowed: Boolean = false,
+    val radioPartners: Set<Int> = emptySet(),
+    val talking: Set<Int> = emptySet(),
+    val meTalking: Boolean = false,
 ) {
     val me get() = snapshot?.players?.firstOrNull { it.id == myId }
     val isHost get() = lobby?.hostId == myId
@@ -115,6 +123,7 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
             playerName = prefs.getString("name", null) ?: Build.MODEL.take(16),
             serverAddress = prefs.getString("server", "") ?: "",
             soundOn = prefs.getBoolean("sound", true),
+            micOn = prefs.getBoolean("mic", true),
         )
     )
     val state: StateFlow<UiState> = _state.asStateFlow()
@@ -140,6 +149,10 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
     private var torchApplied: Boolean? = null
 
     private var wallsSentVersion = -1
+
+    /** Proximity voice chat for the current session (null outside a lobby). */
+    private var voice: VoiceChat? = null
+    private var voiceSeq = 0
 
     private var localServer: GameServer? = null
     private var client: GameClient? = null
@@ -355,6 +368,7 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
         when (msg) {
             is ServerMessage.Welcome -> {
                 ar.myId = msg.playerId
+                viewModelScope.launch { startVoice() }
                 _state.update { it.copy(myId = msg.playerId, screen = Screen.SESSION, status = null) }
             }
             is ServerMessage.LobbyState -> {
@@ -377,6 +391,10 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
             is ServerMessage.Snapshot -> {
+                val me = _state.value.myId
+                val partners = msg.radio.mapNotNull { l -> if (l.a == me) l.b else if (l.b == me) l.a else null }.toSet()
+                voice?.transmit = _state.value.micOn && partners.isNotEmpty()
+                if (partners != _state.value.radioPartners) _state.update { it.copy(radioPartners = partners) }
                 ar.beacons = msg.players.filter { it.id != _state.value.myId }.mapNotNull { p -> p.beacon?.let { p.id to it } }.toMap()
                 val wasDead = _state.value.me?.alive == false
                 _state.update { it.copy(snapshot = msg) }
@@ -399,6 +417,7 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
             is ServerMessage.Obstacles -> _state.update { it.copy(walls = msg.walls) }
+            is ServerMessage.Voice -> runCatching { Base64.getDecoder().decode(msg.data) }.getOrNull()?.let { voice?.receive(msg.from, it) }
             is ServerMessage.HitBy -> {
                 vibrate(if (msg.eliminated) 600 else 150)
                 sfx.play(if (msg.eliminated) Sfx.TAGGED_OUT else Sfx.DAMAGE)
@@ -482,6 +501,38 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
         return (base ?: VisionHint()).copy(clearDistanceM = depth)
     }
 
+    // ------------------------------------------------------------------ voice chat
+
+    private fun startVoice() {
+        if (voice != null) return
+        voice = VoiceChat(
+            getApplication(),
+            onFrame = { frame -> client?.sendDroppable(ClientMessage.Voice(voiceSeq++, Base64.getEncoder().encodeToString(frame))) },
+            onTalking = { ids -> _state.update { it.copy(talking = ids) } },
+            onSpeaking = { on -> _state.update { it.copy(meTalking = on) } },
+        ).also { it.start() }
+    }
+
+    private fun stopVoice() {
+        val v = voice ?: return
+        voice = null
+        v.transmit = false
+        Thread { v.stop() }.start()
+    }
+
+    /** RECORD_AUDIO granted or revoked; listening works either way, talking needs it. */
+    fun onMicPermission(granted: Boolean) {
+        _state.update { it.copy(micAllowed = granted) }
+        if (granted) voice?.startCaptureIfAllowed()
+    }
+
+    fun toggleMic() {
+        val on = !_state.value.micOn
+        prefs.edit().putBoolean("mic", on).apply()
+        _state.update { it.copy(micOn = on) }
+        if (!on) voice?.transmit = false
+    }
+
     // ------------------------------------------------------------------ flashlight
 
     fun cycleTorchMode() = _state.update {
@@ -544,12 +595,16 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
         ar.myId = 0
         ar.beacons = emptyMap()
         beaconSent = false
+        stopVoice()
         ar.setTorch(false)
         torch.reset()
         torchApplied = null
         wallsSentVersion = -1
         _state.update {
-            UiState(playerName = it.playerName, serverAddress = it.serverAddress, error = it.error, soundOn = it.soundOn, torchMode = it.torchMode)
+            UiState(
+                playerName = it.playerName, serverAddress = it.serverAddress, error = it.error, soundOn = it.soundOn,
+                torchMode = it.torchMode, micOn = it.micOn, micAllowed = it.micAllowed,
+            )
         }
     }
 

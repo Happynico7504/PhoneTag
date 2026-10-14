@@ -12,12 +12,15 @@ import kotlinx.serialization.json.Json
  * or on a dedicated machine on the internet, so the client never needs to care which.
  */
 object Protocol {
-    const val VERSION = 4
+    const val VERSION = 5
 
     /** Hard cap on players per lobby. Never configurable above this. */
     const val MAX_PLAYERS_PER_LOBBY = 16
 
     const val DEFAULT_PORT = 47474
+
+    /** Max base64 length of one voice frame (40 ms of ADPCM is ~430 chars). */
+    const val MAX_VOICE_CHARS = 1024
 
     /** Upper bound on a single framed line; protects the server from memory abuse. */
     const val MAX_LINE_BYTES = 64 * 1024
@@ -204,6 +207,10 @@ sealed class ClientMessage {
     @Serializable @SerialName("ping")
     data class Ping(val clientTimeMs: Long) : ClientMessage()
 
+    /** One frame of compressed voice audio (base64). The server forwards it over open radio links only. */
+    @Serializable @SerialName("voice")
+    data class Voice(val seq: Int, val data: String) : ClientMessage()
+
     @Serializable @SerialName("leave")
     data object Leave : ClientMessage()
 }
@@ -238,7 +245,13 @@ sealed class ServerMessage {
     data class Snapshot(
         val timeLeftMs: Long,
         val players: List<PlayerSnapshot>,
+        /** Pairs of players currently connected by proximity voice chat (far enough apart). */
+        val radio: List<RadioLink> = emptyList(),
     ) : ServerMessage()
+
+    /** Voice audio from another player, forwarded only over an open [RadioLink]. */
+    @Serializable @SerialName("voice")
+    data class Voice(val from: Int, val seq: Int, val data: String) : ServerMessage()
 
     /** Sent to the shooter for every shot so the client can show hit/miss feedback. */
     @Serializable @SerialName("shot")

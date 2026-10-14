@@ -94,7 +94,8 @@ class GameServer(
         private val conn = Connection(socket, ::onLine, ::onClosed, name = "client")
         @Volatile private var lobby: Lobby? = null
         @Volatile private var playerId = 0
-        private val limiter = RateLimiter(perSecond = 40.0, burst = 80.0)
+        // Voice adds 25 frames/s on top of poses, pings and shots.
+        private val limiter = RateLimiter(perSecond = 60.0, burst = 120.0)
 
         fun start() {
             connectionCount.incrementAndGet()
@@ -102,7 +103,9 @@ class GameServer(
             conn.start()
         }
 
-        private fun send(msg: ServerMessage) = conn.send(Protocol.encode(msg))
+        private fun send(msg: ServerMessage) {
+            if (msg is ServerMessage.Voice) conn.sendDroppable(Protocol.encode(msg)) else conn.send(Protocol.encode(msg))
+        }
 
         private fun onLine(line: String) {
             if (!limiter.tryAcquire()) return

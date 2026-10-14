@@ -122,6 +122,31 @@ torch brightens the camera image itself, so phones without a light sensor briefl
 every 20 s to measure the real ambient light. The HUD and the AR sync screen have a per-phone
 **Light: Auto / On / Off** switch.
 
+### Proximity voice radio
+Players can talk over the radio **only when they're at least 10 m apart**. Up close you can
+hear each other anyway, and keeping the radio muted there prevents feedback, where one phone's
+speaker loops into a nearby phone's mic.
+
+- **Routing** (`core/.../VoiceRouter.kt`): the server works out every pair's distance 5 times
+  a second, using exact arena positions when both players are synced and GPS otherwise. A link
+  opens after a pair has stayed beyond 10.5 m for 1 s, so GPS jitter doesn't make it flap. It
+  closes instantly within 9.5 m. Unknown or stale positions count as "no link". In team mode only
+  teammates are linked. Voice frames are forwarded over open links only, and never back to the
+  sender.
+- **Audio** (`app/.../voice/`): 16 kHz mono from the phone's voice-communication mic, with the
+  platform echo canceller and noise suppressor on. Voice activity detection with an adaptive
+  noise floor means only speech is sent, and only while someone is in radio range. 40 ms
+  IMA-ADPCM frames (4:1 compression, about 64 kbit/s while talking) travel over the existing
+  game connection, so voice works the same over Wi-Fi Direct and the dedicated server, with no
+  extra ports or native libraries. Each frame decodes on its own, so a lost frame costs only
+  40 ms. Voice is sent as droppable data and discarded rather than queued when a link is busy,
+  so it can never get a player disconnected.
+- **Playback:** small per-talker jitter buffers (80 ms) are mixed into one stream, played on a
+  connected headset if there is one, otherwise the loudspeaker.
+- **UI:** a mic switch and a "Radio: …" line showing who you're connected to, with 🔊 on
+  whoever is talking, both on the AR markers and in the HUD. The radar shows a dashed 10 m
+  ring. The microphone permission is optional: without it you can still listen.
+
 ### AR view & sound
 - **Player markers in the camera image.** Each player's GPS bearing is projected into the viewfinder
   using the real camera's field of view (read from the lens focal length and sensor size).

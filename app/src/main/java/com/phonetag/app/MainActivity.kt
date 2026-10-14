@@ -35,6 +35,7 @@ class MainActivity : ComponentActivity() {
         add(Manifest.permission.ACCESS_COARSE_LOCATION)
         add(Manifest.permission.CAMERA)
         if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.NEARBY_WIFI_DEVICES)
+        add(Manifest.permission.RECORD_AUDIO) // optional: proximity voice chat
     }.toTypedArray()
 
     private fun missingPermissions() = requiredPermissions.filter {
@@ -58,6 +59,8 @@ class MainActivity : ComponentActivity() {
                 LaunchedEffect(essentialGranted) {
                     if (essentialGranted) vm.onPermissionsGranted()
                 }
+                val micGranted = Manifest.permission.RECORD_AUDIO !in missing
+                LaunchedEffect(micGranted) { vm.onMicPermission(micGranted) }
                 if (!essentialGranted) {
                     PermissionScreen(onRequest = { launcher.launch(requiredPermissions) })
                     LaunchedEffect(Unit) { launcher.launch(requiredPermissions) }

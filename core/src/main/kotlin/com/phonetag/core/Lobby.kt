@@ -43,6 +43,7 @@ class Lobby(
     }
 
     private val players = LinkedHashMap<Int, Player>()
+    private val radio = VoiceRouter()
     private var nextId = 1
     private var hostId = 0
     private var matchEndsAtMs = 0L
@@ -129,6 +130,11 @@ class Lobby(
                 broadcastLobby()
             }
             is ClientMessage.Ping -> p.sink(ServerMessage.Pong(msg.clientTimeMs))
+            is ClientMessage.Voice -> {
+                if (msg.data.length > Protocol.MAX_VOICE_CHARS) return
+                val frame = ServerMessage.Voice(p.id, msg.seq, msg.data)
+                for (q in players.values) if (q.id != p.id && radio.canHear(p.id, q.id)) q.sink(frame)
+            }
             is ClientMessage.SetBeacon -> {
                 val screen = msg.screen
                 if (screen == null || msg.epoch != arena.epoch || !screen.isFinite()) {
@@ -172,6 +178,10 @@ class Lobby(
     @Synchronized
     fun tick() {
         val now = clock()
+        radio.update(
+            players.values.map { VoiceRouter.Member(it.id, it.team, it.pose?.takeIf { _ -> now - it.poseAtMs <= STALE_POSE_MS }) },
+            settings.mode, now,
+        )
         if (wallsDirty && now - wallsBroadcastAtMs >= WALLS_BROADCAST_INTERVAL_MS) {
             wallsDirty = false
             wallsBroadcastAtMs = now
@@ -210,6 +220,7 @@ class Lobby(
                     beacon = it.beacon?.takeIf { _ -> now - it.beaconAtMs <= STALE_BEACON_MS },
                 )
             },
+            radio = radio.links(),
         )
         broadcast(snap)
     }

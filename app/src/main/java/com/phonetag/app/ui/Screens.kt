@@ -60,6 +60,7 @@ import com.phonetag.app.UiState
 import com.phonetag.core.GameMode
 import com.phonetag.core.Phase
 import com.phonetag.core.Protocol
+import com.phonetag.core.VoiceRouter
 import com.phonetag.core.ServerMessage
 import com.phonetag.core.Team
 
@@ -333,6 +334,17 @@ private fun LobbyScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolea
         }
 
         ArenaRow(vm, state, cameraGranted)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Voice radio", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "Talks to ${if (settings.mode == GameMode.TEAMS) "teammates" else "players"} more than ${VoiceRouter.RANGE_M.toInt()} m away; " +
+                        "muted up close to avoid feedback. Headphones work best.",
+                    color = Color.Gray, fontSize = 13.sp,
+                )
+            }
+            MicButton(state, vm::toggleMic)
+        }
 
         if (state.isHost) {
             Text("Settings", style = MaterialTheme.typography.titleMedium)

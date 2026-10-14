@@ -28,6 +28,11 @@ class GameClient(
         conn?.send(Protocol.encode(msg))
     }
 
+    /** Real-time data (voice): dropped rather than queued if the connection is backed up. */
+    fun sendDroppable(msg: ClientMessage) {
+        conn?.sendDroppable(Protocol.encode(msg))
+    }
+
     fun disconnect() {
         conn?.let {
             it.send(Protocol.encode(ClientMessage.Leave))

@@ -52,7 +52,7 @@ import kotlin.random.Random
 data class CameraFov(val longDeg: Double = 66.0, val shortDeg: Double = 52.0)
 
 /** Everything the AR layer needs to know about another player for one frame. */
-data class ArPlayer(val snap: PlayerSnapshot, val name: String, val team: Team, val friendly: Boolean)
+data class ArPlayer(val snap: PlayerSnapshot, val name: String, val team: Team, val friendly: Boolean, val talking: Boolean = false)
 
 private const val LASER_SECS = 0.16
 private const val MUZZLE_SECS = 0.09
@@ -602,7 +602,7 @@ private fun DrawScope.drawPlayerMarker(
     // Name, distance and health bar above the marker.
     val label = text.measure(
         // "AR" = position from shared camera tracking (cm-level), otherwise it's GPS (metres).
-        "${p.name}  ${if (distanceM < 10) "%.1f".format(distanceM) else distanceM.toInt()} m${if (placed.precise) "  AR" else ""}",
+        "${if (p.talking) "🔊 " else ""}${p.name}  ${if (distanceM < 10) "%.1f".format(distanceM) else distanceM.toInt()} m${if (placed.precise) "  AR" else ""}",
         TextStyle(color = Color.White.copy(alpha = alpha), fontSize = 12.sp, fontWeight = FontWeight.Bold),
     )
     val top = pos.y - s * 2.2f - label.size.height - 10 * dp

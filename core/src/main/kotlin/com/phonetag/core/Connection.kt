@@ -42,6 +42,15 @@ class Connection(
         if (!outbox.offer(line)) close()
     }
 
+    /**
+     * For real-time data that is worthless when late (voice): dropped instead of queued when the
+     * peer is falling behind, so it can never cause a slow-consumer disconnect.
+     */
+    fun sendDroppable(line: String) {
+        if (closed.get() || outbox.size > OUTBOX_CAPACITY / 4) return
+        outbox.offer(line)
+    }
+
     fun close() {
         if (!closed.compareAndSet(false, true)) return
         outbox.clear()
