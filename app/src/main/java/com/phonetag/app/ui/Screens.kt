@@ -52,6 +52,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.phonetag.app.GameViewModel
+import com.phonetag.app.LobbySearch
 import com.phonetag.app.Screen
 import com.phonetag.app.Transport
 import com.phonetag.app.ar.ArCameraView
@@ -308,8 +309,14 @@ private fun OnlineScreen(vm: GameViewModel, state: UiState) {
         }
         HorizontalDivider()
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Open lobbies", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+            Text("Open lobbies within ${Protocol.LOBBY_LIST_RADIUS_KM.toInt()} km", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+            if (state.lobbySearch == LobbySearch.LOADING) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
             TextButton(onClick = vm::refreshOnlineLobbies, enabled = serverReady) { Text("Refresh") }
+        }
+        when {
+            state.lobbySearch == LobbySearch.NO_GPS -> Hint("Waiting for a GPS fix to find lobbies near you…")
+            state.lobbySearch == LobbySearch.DONE && state.onlineLobbies.isEmpty() ->
+                Hint("No open lobbies within ${Protocol.LOBBY_LIST_RADIUS_KM.toInt()} km. Create one, or join a friend's with its code.")
         }
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             items(state.onlineLobbies, key = { it.code }) { l ->
@@ -320,7 +327,10 @@ private fun OnlineScreen(vm: GameViewModel, state: UiState) {
                             Text(l.name, fontWeight = FontWeight.Bold)
                             Text(l.code, fontFamily = FontFamily.Monospace, color = Color.Gray)
                         }
-                        Text("${l.players}/${l.maxPlayers}", color = if (full) RedTeam else Color.Unspecified)
+                        Column(horizontalAlignment = Alignment.End) {
+                            Text("${l.players}/${l.maxPlayers}", color = if (full) RedTeam else Color.Unspecified)
+                            l.distanceKm?.let { Text("~$it km", color = Color.Gray, fontSize = 12.sp) }
+                        }
                     }
                 }
             }

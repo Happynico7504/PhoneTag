@@ -12,12 +12,15 @@ import kotlinx.serialization.json.Json
  * or on a dedicated machine on the internet, so the client never needs to care which.
  */
 object Protocol {
-    const val VERSION = 7
+    const val VERSION = 8
 
     /** Hard cap on players per lobby. Never configurable above this. */
     const val MAX_PLAYERS_PER_LOBBY = 16
 
     const val DEFAULT_PORT = 47474
+
+    /** The open-lobby list only shows lobbies whose players are within this distance of you. */
+    const val LOBBY_LIST_RADIUS_KM = 5.0
 
     /** Max base64 length of one voice frame (40 ms of ADPCM is ~430 chars). */
     const val MAX_VOICE_CHARS = 1024
@@ -152,6 +155,8 @@ data class LobbySummary(
     val players: Int,
     val maxPlayers: Int,
     val phase: Phase,
+    /** Rounded-up distance to the lobby in km (no coordinates are ever shared). */
+    val distanceKm: Int? = null,
 )
 
 @Serializable
@@ -178,7 +183,11 @@ sealed class ClientMessage {
     ) : ClientMessage()
 
     @Serializable @SerialName("list")
-    data object ListLobbies : ClientMessage()
+    /**
+     * Asks for open lobbies near ([Protocol.LOBBY_LIST_RADIUS_KM]) the given GPS position. The
+     * server filters, so lobby locations never leave it. No position = empty list.
+     */
+    data class ListLobbies(val lat: Double? = null, val lon: Double? = null) : ClientMessage()
 
     @Serializable @SerialName("team")
     data class SetTeam(val team: Team) : ClientMessage()

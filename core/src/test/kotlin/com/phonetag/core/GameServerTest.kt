@@ -78,10 +78,31 @@ class GameServerTest {
         val otherCode = bBot.await<ServerMessage.Welcome>().lobbyCode
         assertTrue(code != otherCode)
 
+        // Lobby locations come from their players' GPS: alice at the origin, bob 3 km east.
+        a.send(ClientMessage.PoseUpdate(trackedPose(0.0, 0.0)))
+        b.send(ClientMessage.PoseUpdate(trackedPose(90.0, 3_000.0)))
+        aBot.await<ServerMessage.Snapshot> { snap -> snap.players.all { it.pose != null } }
+        bBot.await<ServerMessage.Snapshot> { snap -> snap.players.all { it.pose != null } }
+        // A lobby 8 km away and one with no location yet are not listed.
+        val (far, farBot) = client(s)
+        far.send(ClientMessage.Hello(Protocol.VERSION, "far", create = true, arTracking = true, deviceId = dev()))
+        farBot.await<ServerMessage.Welcome>()
+        far.send(ClientMessage.PoseUpdate(trackedPose(0.0, 8_000.0)))
+        farBot.await<ServerMessage.Snapshot> { snap -> snap.players.all { it.pose != null } }
+        val (nopos, noposBot) = client(s)
+        nopos.send(ClientMessage.Hello(Protocol.VERSION, "nopos", create = true, arTracking = true, deviceId = dev()))
+        noposBot.await<ServerMessage.Welcome>()
+
         val (c, cBot) = client(s)
-        c.send(ClientMessage.ListLobbies)
+        val here = trackedPose(0.0, 400.0) // carol is 400 m north of alice
+        c.send(ClientMessage.ListLobbies(here.lat, here.lon))
         val list = cBot.await<ServerMessage.LobbyList>()
-        assertEquals(setOf(code, otherCode), list.lobbies.map { it.code }.toSet())
+        assertEquals(listOf(code to 1, otherCode to 4), list.lobbies.map { it.code to it.distanceKm }) // nearest first, rounded up
+
+        // Without a position nothing is listed (lobby locations are never sent to clients).
+        cBot.inbox.clear()
+        c.send(ClientMessage.ListLobbies())
+        assertEquals(emptyList(), cBot.await<ServerMessage.LobbyList>().lobbies)
         c.send(ClientMessage.Hello(Protocol.VERSION, "carol", lobbyCode = code.lowercase(), arTracking = true, deviceId = dev()))
         assertNotNull(cBot.await<ServerMessage.Welcome>())
         aBot.await<ServerMessage.LobbyState> { it.players.map { p -> p.name } == listOf("alice", "carol") }

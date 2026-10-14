@@ -319,6 +319,13 @@ The **Official server** choice, selected by default, connects to the public inst
 `phonetag.nicochristmann.net:47474` without typing anything. Your custom address is kept
 separately, so you can switch back and forth.
 
+**Nearby lobbies only:** the open-lobby list shows lobbies within **5 km** of you, nearest first,
+with a rounded distance like "~2 km". The app sends your GPS position with the request and the
+server does the filtering, so no phone ever receives another lobby's coordinates. A lobby's
+location is its host's last GPS fix, or another player's if the host has none. Lobbies with no
+fix yet aren't listed, but **joining by code works at any distance**. Without a GPS fix the app
+waits and searches as soon as one arrives.
+
 **Favorites:** with a custom address entered, tap **☆ Save** to store it under a name. Saved
 servers appear as a list in the online menu: tap one to switch to it and load its lobbies, or
 tap ✕ to remove it. Favorites live on the phone, newest first, up to 20. The same server

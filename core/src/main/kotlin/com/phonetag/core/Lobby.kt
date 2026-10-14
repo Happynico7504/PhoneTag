@@ -73,6 +73,11 @@ class Lobby(
     @get:Synchronized
     val playerCount get() = players.size
 
+    /** Where the lobby is: the host's last GPS fix, else any player's. Null until someone has one. */
+    @Synchronized
+    fun location(): Pair<Double, Double>? =
+        (players[hostId]?.pose ?: players.values.firstNotNullOfOrNull { it.pose })?.let { it.lat to it.lon }
+
     @Synchronized
     fun summary() = LobbySummary(code, name, players.size, settings.maxPlayers, phase)
 
@@ -185,7 +190,7 @@ class Lobby(
                 broadcastLobby()
                 broadcast(ServerMessage.Obstacles(arena.epoch, emptyList()))
             }
-            is ClientMessage.Hello, ClientMessage.ListLobbies, ClientMessage.Leave -> Unit // handled by the server
+            is ClientMessage.Hello, is ClientMessage.ListLobbies, ClientMessage.Leave -> Unit // handled by the server
         }
     }
 

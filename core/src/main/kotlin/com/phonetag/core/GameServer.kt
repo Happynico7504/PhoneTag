@@ -181,9 +181,7 @@ class GameServer(
             }
             when (msg) {
                 is ClientMessage.Hello -> hello(msg)
-                is ClientMessage.ListLobbies -> send(
-                    ServerMessage.LobbyList(lobbies.values.map { it.summary() }.filter { it.phase != Phase.RUNNING }.take(100))
-                )
+                is ClientMessage.ListLobbies -> send(ServerMessage.LobbyList(nearbyLobbies(msg.lat, msg.lon)))
                 is ClientMessage.Ping -> send(ServerMessage.Pong(msg.clientTimeMs))
                 is ClientMessage.Leave -> conn.close()
                 else -> send(ServerMessage.Error(ErrorCode.BAD_REQUEST, "Say hello first"))
@@ -243,6 +241,23 @@ class GameServer(
             l.leave(playerId)
             removeIfEmpty(l)
         }
+    }
+
+    /**
+     * Open lobbies within [Protocol.LOBBY_LIST_RADIUS_KM] of the caller, nearest first. Lobbies
+     * without a known location yet are left out (they can still be joined by code).
+     */
+    private fun nearbyLobbies(lat: Double?, lon: Double?): List<LobbySummary> {
+        if (lat == null || lon == null || !lat.isFinite() || !lon.isFinite() || lat !in -90.0..90.0 || lon !in -180.0..180.0) {
+            return emptyList()
+        }
+        return lobbies.values.mapNotNull { lobby ->
+            val (la, lo) = lobby.location() ?: return@mapNotNull null
+            val km = Geo.distanceM(lat, lon, la, lo) / 1000.0
+            val summary = lobby.summary()
+            if (km > Protocol.LOBBY_LIST_RADIUS_KM || summary.phase == Phase.RUNNING) return@mapNotNull null
+            km to summary.copy(distanceKm = kotlin.math.ceil(km).toInt().coerceAtLeast(1))
+        }.sortedBy { it.first }.take(100).map { it.second }
     }
 
     private fun createLobby(name: String): Lobby {

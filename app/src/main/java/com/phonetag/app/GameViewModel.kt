@@ -59,6 +59,9 @@ enum class Screen { HOME, NEARBY, ONLINE, CONNECTING, SESSION }
 
 enum class Transport { WIFI_DIRECT_HOST, WIFI_DIRECT_JOIN, ONLINE }
 
+/** State of the nearby-lobby search in online play. */
+enum class LobbySearch { IDLE, NO_GPS, LOADING, DONE }
+
 /** Flashlight behaviour, chosen per phone. */
 enum class TorchMode { AUTO, ON, OFF }
 
@@ -96,7 +99,9 @@ data class UiState(
     val lobby: ServerMessage.LobbyState? = null,
     val snapshot: ServerMessage.Snapshot? = null,
     val results: ServerMessage.MatchEnded? = null,
+    /** Open lobbies within [Protocol.LOBBY_LIST_RADIUS_KM] of us, nearest first (server-filtered). */
     val onlineLobbies: List<LobbySummary> = emptyList(),
+    val lobbySearch: LobbySearch = LobbySearch.IDLE,
     val feed: List<FeedItem> = emptyList(),
     val soundOn: Boolean = true,
     /** Full-screen AR view for syncing this phone to the shared arena. */
@@ -198,7 +203,11 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
         viewModelScope.launch {
-            locations.location.collect { loc -> loc?.let(orientation::updateDeclination) }
+            locations.location.collect { loc ->
+                loc?.let(orientation::updateDeclination)
+                // The lobby list waited for a GPS fix: search now that we have one.
+                if (loc != null && _state.value.screen == Screen.ONLINE && _state.value.lobbySearch == LobbySearch.NO_GPS) refreshOnlineLobbies()
+            }
         }
     }
 
@@ -332,19 +341,29 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
         )
     }
 
+    /**
+     * Lists open lobbies near us. We send our GPS position and the server returns only lobbies
+     * within 5 km, so other players' locations never reach this phone.
+     */
     fun refreshOnlineLobbies() {
         val (host, port) = activeServer() ?: return fail("Enter a server address like play.example.com:47474")
+        val here = locations.location.value
+            ?: return _state.update { it.copy(lobbySearch = LobbySearch.NO_GPS, onlineLobbies = emptyList()) }
+        _state.update { it.copy(lobbySearch = LobbySearch.LOADING) }
         viewModelScope.launch(Dispatchers.IO) {
             val probe = GameClient(
-                onMessage = { msg -> if (msg is ServerMessage.LobbyList) _state.update { it.copy(onlineLobbies = msg.lobbies) } },
+                onMessage = { msg ->
+                    if (msg is ServerMessage.LobbyList) _state.update { it.copy(onlineLobbies = msg.lobbies, lobbySearch = LobbySearch.DONE) }
+                },
                 onDisconnected = {},
             )
             runCatching {
                 probe.connect(host, port)
-                probe.send(ClientMessage.ListLobbies)
+                probe.send(ClientMessage.ListLobbies(here.latitude, here.longitude))
                 delay(1500)
-            }.onFailure { e -> _state.update { it.copy(error = "Server unreachable: ${e.message}") } }
+            }.onFailure { e -> _state.update { it.copy(error = "Server unreachable: ${e.message}", lobbySearch = LobbySearch.IDLE) } }
             probe.disconnect()
+            _state.update { if (it.lobbySearch == LobbySearch.LOADING) it.copy(lobbySearch = LobbySearch.IDLE) else it }
         }
     }
 
