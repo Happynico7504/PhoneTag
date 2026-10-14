@@ -424,6 +424,34 @@ private fun <T> ChoiceRow(label: String, options: List<Pair<T, String>>, selecte
     }
 }
 
+/**
+ * "Random hunters": who shot the most bystanders this match. Only counted when the camera saw a
+ * person in the crosshair and no player was anywhere near the line of fire.
+ */
+private fun androidx.compose.foundation.lazy.LazyListScope.randomsLeaderboard(results: ServerMessage.MatchEnded, state: UiState) {
+    val hunters = results.scores.filter { it.randoms > 0 }.sortedByDescending { it.randoms }
+    item {
+        Spacer(Modifier.height(16.dp))
+        Text("Random hunters", style = MaterialTheme.typography.titleMedium, color = RandomOrange)
+        Text("Shots that hit a bystander instead of a player", color = Color.Gray, fontSize = 13.sp)
+    }
+    if (hunters.isEmpty()) {
+        item { Text("Nobody shot a random. Clean match!", color = Color.LightGray, modifier = Modifier.padding(vertical = 8.dp)) }
+    }
+    items(hunters.size) { i ->
+        val line = hunters[i]
+        Row(
+            Modifier.fillMaxWidth()
+                .background(if (i == 0) RandomOrange.copy(alpha = 0.25f) else Color(0x18FFFFFF), RoundedCornerShape(8.dp))
+                .padding(12.dp),
+        ) {
+            Text(if (i == 0) "🙈" else "${i + 1}", Modifier.width(28.dp))
+            Text(line.name + if (line.id == state.myId) " (you)" else "", Modifier.weight(1f))
+            Text("${line.randoms} random${if (line.randoms == 1) "" else "s"}", fontWeight = FontWeight.Bold, color = RandomOrange)
+        }
+    }
+}
+
 @Composable
 private fun ResultsScreen(vm: GameViewModel, state: UiState, results: ServerMessage.MatchEnded) {
     val headline = when {
@@ -440,6 +468,7 @@ private fun ResultsScreen(vm: GameViewModel, state: UiState, results: ServerMess
             Text("Player", Modifier.weight(1f), color = Color.Gray)
             Text("Tags", Modifier.width(56.dp), color = Color.Gray, textAlign = TextAlign.End)
             Text("Outs", Modifier.width(56.dp), color = Color.Gray, textAlign = TextAlign.End)
+            Text("Rnd", Modifier.width(48.dp), color = Color.Gray, textAlign = TextAlign.End)
         }
         LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             items(results.scores.size) { i ->
@@ -453,8 +482,10 @@ private fun ResultsScreen(vm: GameViewModel, state: UiState, results: ServerMess
                     Text(line.name, Modifier.weight(1f), color = if (line.team != Team.NONE) line.team.color() else Color.Unspecified)
                     Text("${line.score}", Modifier.width(56.dp), textAlign = TextAlign.End, fontWeight = FontWeight.Bold)
                     Text("${line.deaths}", Modifier.width(56.dp), textAlign = TextAlign.End)
+                    Text("${line.randoms}", Modifier.width(48.dp), textAlign = TextAlign.End, color = if (line.randoms > 0) RandomOrange else Color.Unspecified)
                 }
             }
+            randomsLeaderboard(results, state)
         }
         if (state.isHost) {
             Button(onClick = vm::backToLobby, modifier = Modifier.fillMaxWidth()) { Text("Back to lobby") }

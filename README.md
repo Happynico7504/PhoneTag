@@ -147,6 +147,23 @@ speaker loops into a nearby phone's mic.
   whoever is talking, both on the AR markers and in the HUD. The radar shows a dashed 10 m
   ring. The microphone permission is optional: without it you can still listen.
 
+### Random shots ("randoms")
+On-device person detection also catches players shooting **bystanders**. A missed shot counts
+as a random when all of these hold (`HitResolver.isBystanderShot`):
+- the shooter's camera saw a person under the crosshair (ML Kit pose detection);
+- the shot hit no player, and wasn't stopped by an obstacle;
+- **no** player of any team, alive or not, is anywhere near the line of fire. "Near" is generous:
+  at least 15°, or double the normal hit tolerance if that's wider. A narrowly missed player
+  therefore never counts as a random;
+- the person isn't clearly out of range by their estimated distance.
+
+The server counts randoms per player for each match and announces each one to everyone. It
+appears as an orange line in the kill feed, "Alex shot a random! (3)". The shooter gets a comic
+slide-whistle sound, a "RANDOM! ×3" banner and an orange "NOT A PLAYER" box around the person
+they hit. The HUD shows your running count. The end-of-match screen adds a **Rnd** column and a
+**Random hunters** leaderboard. No camera images ever leave the phone, only the yes/no "person
+in crosshair" flag already sent with every shot.
+
 ### AR view & sound
 - **Player markers in the camera image.** Each player's GPS bearing is projected into the viewfinder
   using the real camera's field of view (read from the lens focal length and sensor size).

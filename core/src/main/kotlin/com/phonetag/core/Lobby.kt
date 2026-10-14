@@ -30,6 +30,7 @@ class Lobby(
         var lastShotAtMs: Long = 0,
         var score: Int = 0,
         var deaths: Int = 0,
+        var randoms: Int = 0,
         var beacon: Rigid? = null,
         var beaconAtMs: Long = 0,
     ) {
@@ -218,6 +219,7 @@ class Lobby(
                     score = it.score,
                     deaths = it.deaths,
                     beacon = it.beacon?.takeIf { _ -> now - it.beaconAtMs <= STALE_BEACON_MS },
+                    randoms = it.randoms,
                 )
             },
             radio = radio.links(),
@@ -266,6 +268,7 @@ class Lobby(
             p.health = MAX_HEALTH
             p.score = 0
             p.deaths = 0
+            p.randoms = 0
             p.respawnAtMs = 0
             p.lastShotAtMs = 0
             p.invulnerableUntilMs = now + SPAWN_PROTECTION_MS
@@ -299,7 +302,17 @@ class Lobby(
         val resolution = HitResolver.resolveDetailed(shooter.pose!!, candidates, settings.maxRangeM, msg.vision, arena.epoch, allWalls)
         val hit = resolution.hit
         if (hit == null) {
-            shooter.sink(ServerMessage.ShotResult(msg.seq, null, null, false, blocked = resolution.blockedId != null))
+            // Every other player with a known position counts here (any team, alive or not):
+            // a person in the crosshair near *any* player is not a bystander.
+            val everyone = players.values.filter { it.id != shooter.id && it.pose != null && now - it.poseAtMs <= STALE_POSE_MS }
+                .map { HitResolver.Candidate(it.id, it.pose!!) }
+            val random = resolution.blockedId == null &&
+                HitResolver.isBystanderShot(shooter.pose!!, everyone, settings.maxRangeM, msg.vision)
+            shooter.sink(ServerMessage.ShotResult(msg.seq, null, null, false, blocked = resolution.blockedId != null, random = random))
+            if (random) {
+                shooter.randoms++
+                broadcast(ServerMessage.RandomShot(shooter.id, shooter.randoms))
+            }
             return
         }
         val victim = players.getValue(hit.targetId)
@@ -318,7 +331,7 @@ class Lobby(
     private fun endMatch() {
         phase = Phase.ENDED
         val lines = players.values
-            .map { ScoreLine(it.id, it.name, it.team, it.score, it.deaths) }
+            .map { ScoreLine(it.id, it.name, it.team, it.score, it.deaths, it.randoms) }
             .sortedWith(compareByDescending<ScoreLine> { it.score }.thenBy { it.deaths })
         var winnerTeam: Team? = null
         var winnerId: Int? = null

@@ -12,7 +12,7 @@ import kotlinx.serialization.json.Json
  * or on a dedicated machine on the internet, so the client never needs to care which.
  */
 object Protocol {
-    const val VERSION = 5
+    const val VERSION = 6
 
     /** Hard cap on players per lobby. Never configurable above this. */
     const val MAX_PLAYERS_PER_LOBBY = 16
@@ -139,6 +139,8 @@ data class PlayerSnapshot(
     val deaths: Int,
     /** Pose of the sync marker on this player's screen (arena frame), while they show it. */
     val beacon: Rigid? = null,
+    /** Shots this match that hit a bystander ("random") instead of a player. */
+    val randoms: Int = 0,
 )
 
 @Serializable
@@ -151,7 +153,7 @@ data class LobbySummary(
 )
 
 @Serializable
-data class ScoreLine(val id: Int, val name: String, val team: Team, val score: Int, val deaths: Int)
+data class ScoreLine(val id: Int, val name: String, val team: Team, val score: Int, val deaths: Int, val randoms: Int = 0)
 
 // ---------------------------------------------------------------- client -> server
 
@@ -265,6 +267,8 @@ sealed class ServerMessage {
         val blocked: Boolean = false,
         /** Rejected: the shooter's phone wasn't tracking in the arena when firing. */
         val untracked: Boolean = false,
+        /** Missed every player, but the camera saw a person in the crosshair: a bystander was "shot". */
+        val random: Boolean = false,
     ) : ServerMessage()
 
     /** The shared wall map of the current arena epoch (sent when it changes, at most every 2 s). */
@@ -278,6 +282,10 @@ sealed class ServerMessage {
     /** Broadcast when someone is tagged out. */
     @Serializable @SerialName("tag")
     data class Tagged(val shooterId: Int, val victimId: Int) : ServerMessage()
+
+    /** Broadcast when someone shoots a bystander; [total] is their count this match. */
+    @Serializable @SerialName("random")
+    data class RandomShot(val shooterId: Int, val total: Int) : ServerMessage()
 
     @Serializable @SerialName("end")
     data class MatchEnded(val scores: List<ScoreLine>, val winnerTeam: Team?, val winnerId: Int?) : ServerMessage()

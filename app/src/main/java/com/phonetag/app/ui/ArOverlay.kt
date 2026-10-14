@@ -93,6 +93,10 @@ class ArEffects {
     private var shieldUntil = -1e9
     private var heartbeatAt = -1e9
     private var blockedAt = -1e9
+    private var randomAt = -1e9
+
+    /** 1 right after we shot a bystander, fading to 0 over a second (tints their detection box). */
+    fun randomFlash(): Float = (1 - (t - randomAt) / 1.0).toFloat().coerceIn(0f, 1f)
     private var banner: Banner? = null
 
     private fun now() = System.nanoTime() / 1e9
@@ -161,6 +165,10 @@ class ArEffects {
                 dust(density, n)
             }
             GameEvent.ShotUntracked -> banner = Banner("NOT TRACKING", Color(0xFFFFC107), n)
+            is GameEvent.ShotRandom -> {
+                randomAt = n
+                banner = Banner("RANDOM! ×${e.total}", RandomOrange, n)
+            }
         }
     }
 
@@ -431,7 +439,7 @@ fun ArOverlay(
     val text = rememberTextMeasurer()
     Canvas(modifier) {
         effects.frameNanos // subscribe to the frame clock
-        if (person != null && !dead) drawPersonBox(person)
+        if (person != null && !dead) drawPersonBox(person, effects.randomFlash(), text)
         if (myPose != null) {
             val arView = arView()
             val myPose = myPose.copy(arena = myArena())
@@ -505,11 +513,21 @@ private fun DrawScope.drawWalls(walls: List<Wall>, view: ArView) {
     }
 }
 
-/** Corner brackets around a person found by the on-device detector. */
-private fun DrawScope.drawPersonBox(r: ViewRect) {
+val RandomOrange = Color(0xFFFF9100)
+
+/**
+ * Corner brackets around a person found by the on-device detector. Right after a "random" shot
+ * ([randomFlash] > 0) the box turns orange and is labelled, so it's clear who got shot.
+ */
+private fun DrawScope.drawPersonBox(r: ViewRect, randomFlash: Float, text: TextMeasurer) {
     val dp = density
     val l = min(r.width, r.height) * 0.18f
-    val col = Color.White.copy(alpha = 0.55f)
+    val col = if (randomFlash > 0f) RandomOrange.copy(alpha = 0.5f + 0.5f * randomFlash) else Color.White.copy(alpha = 0.55f)
+    if (randomFlash > 0f) {
+        drawRect(RandomOrange.copy(alpha = 0.18f * randomFlash), topLeft = Offset(r.left, r.top), size = Size(r.width, r.height))
+        val label = text.measure("NOT A PLAYER", TextStyle(color = RandomOrange.copy(alpha = randomFlash), fontSize = 13.sp, fontWeight = FontWeight.Black))
+        drawText(label, topLeft = Offset(r.left + (r.width - label.size.width) / 2, r.top - label.size.height - 4 * dp))
+    }
     for ((x, sx) in listOf(r.left to 1f, r.right to -1f)) for ((y, sy) in listOf(r.top to 1f, r.bottom to -1f)) {
         drawLine(col, Offset(x, y), Offset(x + sx * l, y), 2 * dp, StrokeCap.Round)
         drawLine(col, Offset(x, y), Offset(x, y + sy * l), 2 * dp, StrokeCap.Round)

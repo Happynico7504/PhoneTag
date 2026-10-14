@@ -186,6 +186,7 @@ fun GameScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
                     val left = (state.snapshot?.timeLeftMs ?: 0) / 1000
                     Text("%d:%02d".format(left / 60, left % 60), color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
                     Text("Tags ${me?.score ?: 0} · Outs ${me?.deaths ?: 0}", color = Color.White)
+                    if ((me?.randoms ?: 0) > 0) Text("Randoms ${me?.randoms}", color = RandomOrange, fontSize = 13.sp)
                 }
             }
             Spacer(Modifier.height(6.dp))
@@ -223,7 +224,7 @@ fun GameScreen(vm: GameViewModel, state: UiState, cameraGranted: Boolean) {
                 )
             }
             RadioStatus(state)
-            state.feed.forEach { Text(it.text, color = Color.White, fontSize = 13.sp) }
+            state.feed.forEach { Text(it.text, color = if (it.highlight) RandomOrange else Color.White, fontSize = 13.sp, fontWeight = if (it.highlight) FontWeight.Bold else null) }
 
             Spacer(Modifier.weight(1f))
 

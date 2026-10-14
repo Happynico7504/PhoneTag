@@ -114,6 +114,39 @@ object HitResolver {
         return Resolution(best, if (best == null) blocked else null)
     }
 
+    /** A shot near another player by at least this angle is never a "random" (bystander) shot. */
+    const val BYSTANDER_MIN_CLEARANCE_DEG = 15.0
+
+    /**
+     * True if this (missed) shot hit a bystander: the shooter's camera saw a person in the
+     * crosshair, yet no player is anywhere near the line of fire. "Near" is deliberately generous
+     * (double the hit tolerance, at least 15°) so a narrowly missed player never counts.
+     * [players] should include every other player with a known position, whatever their team or state.
+     */
+    fun isBystanderShot(shooter: Pose, players: List<Candidate>, maxRangeM: Double, vision: VisionHint?): Boolean {
+        if (vision?.personInCrosshair != true) return false
+        // An estimated distance beyond weapon range means the person is out of reach anyway.
+        if (vision.estDistanceM != null && vision.estDistanceM > maxRangeM * 1.5) return false
+        val a = shooter.arena
+        for (c in players) {
+            val b = c.pose.arena
+            val (distance, angleDeg, toleranceDeg) = if (a != null && b != null && a.epoch == b.epoch && a.epoch != 0) {
+                val v = b.position - a.position
+                val d = v.length()
+                val cos = (v.normalized() dot a.forward.normalized()).coerceIn(-1.0, 1.0)
+                val radius = ARENA_BODY_RADIUS_M + ARENA_BASE_SLACK_M + ARENA_SLACK_PER_M * d
+                Triple(d, Math.toDegrees(kotlin.math.acos(cos)), Math.toDegrees(atan2(radius, d.coerceAtLeast(0.1))))
+            } else {
+                val d = Geo.distanceM(shooter.lat, shooter.lon, c.pose.lat, c.pose.lon)
+                val bearing = Geo.bearingDeg(shooter.lat, shooter.lon, c.pose.lat, c.pose.lon)
+                Triple(d, Geo.angleDiffDeg(shooter.azimuthDeg, bearing), allowedConeDeg(d, shooter.accuracyM, c.pose.accuracyM))
+            }
+            if (distance > maxRangeM * 1.5) continue
+            if (angleDeg <= maxOf(BYSTANDER_MIN_CLEARANCE_DEG, toleranceDeg * 2)) return false
+        }
+        return true
+    }
+
     /** [rangeM]: distance along the line of fire to where the shot meets the target. */
     private class Eval(val score: Double, val hit: Hit?, val rangeM: Double = 0.0)
 

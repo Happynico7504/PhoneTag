@@ -58,7 +58,8 @@ enum class Transport { WIFI_DIRECT_HOST, WIFI_DIRECT_JOIN, ONLINE }
 /** Flashlight behaviour, chosen per phone. */
 enum class TorchMode { AUTO, ON, OFF }
 
-data class FeedItem(val text: String, val atMs: Long)
+/** A kill-feed line; [highlight] lines (random shots) are shown in a warning colour. */
+data class FeedItem(val text: String, val atMs: Long, val highlight: Boolean = false)
 
 /** One-shot moments the AR view turns into visual effects (beams, sparks, damage indicators…). */
 sealed interface GameEvent {
@@ -71,6 +72,8 @@ sealed interface GameEvent {
     data object ShotBlocked : GameEvent
     /** Our shot was rejected because this phone wasn't tracking in the arena. */
     data object ShotUntracked : GameEvent
+    /** We shot a bystander: the camera saw a person, but no player was anywhere near the line of fire. */
+    data class ShotRandom(val total: Int) : GameEvent
 }
 
 data class UiState(
@@ -422,6 +425,18 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
                 vibrate(if (msg.eliminated) 600 else 150)
                 sfx.play(if (msg.eliminated) Sfx.TAGGED_OUT else Sfx.DAMAGE)
                 _events.tryEmit(GameEvent.HitTaken(msg.shooterId, msg.eliminated))
+            }
+            is ServerMessage.RandomShot -> {
+                val mine = msg.shooterId == _state.value.myId
+                if (mine) {
+                    sfx.play(Sfx.RANDOM)
+                    _events.tryEmit(GameEvent.ShotRandom(msg.total))
+                }
+                _state.update { s ->
+                    val who = if (mine) "You" else s.nameOf(msg.shooterId)
+                    val text = "$who shot a random! (${msg.total})"
+                    s.copy(feed = (s.feed + FeedItem(text, now, highlight = true)).takeLast(5))
+                }
             }
             is ServerMessage.Tagged -> _state.update { s ->
                 val text = "${s.nameOf(msg.shooterId)} tagged ${s.nameOf(msg.victimId)}"
