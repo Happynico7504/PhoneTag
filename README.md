@@ -217,6 +217,31 @@ Requires JDK 17+ and, for the app, the Android SDK (`ANDROID_HOME` or `local.pro
 
 The GitHub Actions workflow builds all three and uploads the debug APK as an artifact.
 
+## Releasing the app (in-place updates)
+
+CI builds a **release APK** on every push, named after its version (`phonetag-0.1.<run>.apk`).
+Android installs an update over an existing installation, keeping its data and permissions,
+only if both of these hold:
+
+1. **The version code is higher.** It's the GitHub Actions run number, so every CI build is
+   newer than the last. If the workflow is ever recreated and run numbers restart, set the
+   repository variable `PHONETAG_VERSION_CODE_OFFSET` above the last published code. You can
+   also set `PHONETAG_VERSION_CODE` explicitly. Local builds without either use code 1, name
+   `0.1.0-local`.
+2. **It's signed with the same key.** Set this up once:
+   ```bash
+   scripts/create-signing-key.sh            # creates phonetag-release.jks + a random password
+   base64 -w0 phonetag-release.jks          # value for the PHONETAG_KEYSTORE_BASE64 secret
+   ```
+   Add the secrets `PHONETAG_KEYSTORE_BASE64`, `PHONETAG_KEYSTORE_PASSWORD` and
+   `PHONETAG_KEY_ALIAS` (Settings → Secrets and variables → Actions). Back up the `.jks` and the
+   password somewhere safe; `*.jks` is git-ignored. Without the secrets, for example on fork PRs,
+   CI still builds, but signs with a throwaway key and warns that the APK can't update an
+   existing install.
+
+Players who installed an APK signed with a different key, such as an earlier debug build, need
+to uninstall **once**. After that, every signed CI build updates in place.
+
 ## Running the dedicated server
 
 ```bash
