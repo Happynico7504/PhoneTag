@@ -72,7 +72,7 @@ class OcclusionTest {
     @Test
     fun lobbySharesWallsAndReportsBlockedShots() {
         var now = 1_000_000L
-        val lobby = Lobby("WALLS", "t") { now }
+        val lobby = Lobby("WALLS", "t", clock = { now })
         val inbox = mutableMapOf<Int, MutableList<ServerMessage>>()
         fun join(n: String): Int {
             val box = mutableListOf<ServerMessage>()

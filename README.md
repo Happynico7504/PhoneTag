@@ -251,6 +251,37 @@ docker build -f server/Dockerfile -t phonetag-server .
 docker run -p 47474:47474 phonetag-server
 ```
 
+### Anti-cheat and lockouts
+The server (dedicated, or the Wi-Fi Direct host phone) watches for things only a **modified
+client** does, and gives a weighted strike for each:
+
+| Violation | Detected when | Strike |
+|---|---|---|
+| Rapid fire | a shot arrives in under half the weapon cooldown (the app never fires faster than the cooldown) | 0.5 |
+| Speed hack | moving faster than 12 m/s, by AR positions, over more than 3 m | 1.0 |
+| Teleport | jumping more than 30 m within 2 s, by AR positions | 2.5 |
+| Firing untracked | a shot without AR tracking (the app disables the fire button then) | 0.25 |
+| Flooding | each message over the rate limit (60/s) | 0.05 |
+| Malformed / impossible data | unparseable messages, NaN or out-of-range poses, oversized voice frames | 0.5 |
+
+Strikes fade with a 1-minute half-life, so occasional glitches never add up. Examples are an AR
+relocalisation jump, two shots bunched by network jitter, or tracking dropping just as you fire.
+At **5** the player is kicked, everyone sees "X was removed for cheating (reason)", and their
+**IP address and device ID are locked out for 15 minutes**. Reconnecting from either is refused
+with the time left. Movement checks use AR positions only, because GPS is far too jumpy to judge.
+
+- **Device ID:** a salted SHA-256 of Android's per-app `ANDROID_ID`. It survives reinstalls, needs
+  no permission, and the raw ID never leaves the phone.
+- **Options:** `phonetag-server --lockout-minutes N` and `--no-ip-lockout`.
+- **Shared IPs:** use `--no-ip-lockout` if many players share one public IP (carrier CGNAT,
+  one venue Wi-Fi), or if the server only sees a proxy's address, so a lockout doesn't hit
+  everyone behind it.
+- **Exempt:** loopback connections, i.e. the Wi-Fi Direct host's own client.
+- **Lockouts live in memory**, so restarting the server clears them.
+- **Limits:** this only catches what's visible from the server. A modified client can still lie
+  about things the server can't check, like its camera's "person in crosshair" flag, or forge a new
+  device ID, though the IP lockout still applies then.
+
 ### Updating a running server
 `server/update.sh` pulls the latest code, builds the server and swaps it into a running instance
 without recreating anything. Afterwards it checks that the server came back up, and if not it

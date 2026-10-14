@@ -23,7 +23,7 @@ fun trackedPose(bearing: Double, dist: Double, azimuth: Double = 0.0, epoch: Int
 
 class LobbyTest {
     private var now = 1_000_000L
-    private val lobby = Lobby("ABCDE", "test") { now }
+    private val lobby = Lobby("ABCDE", "test", clock = { now })
     private val inbox = mutableMapOf<String, MutableList<ServerMessage>>()
 
     private fun join(name: String): Int {
@@ -216,7 +216,7 @@ class LobbyTest {
 
 class LobbyArenaTest {
     private var now = 1_000_000L
-    private val lobby = Lobby("ABCDE", "test") { now }
+    private val lobby = Lobby("ABCDE", "test", clock = { now })
     private val inbox = mutableMapOf<Int, MutableList<ServerMessage>>()
 
     private fun join(name: String): Int {

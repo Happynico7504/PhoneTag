@@ -12,6 +12,10 @@ import kotlin.test.fail
 /** End-to-end tests over real loopback sockets. */
 class GameServerTest {
     private val servers = mutableListOf<GameServer>()
+    private val devices = java.util.concurrent.atomic.AtomicInteger()
+
+    /** A fresh, valid device ID per simulated phone. */
+    private fun dev() = "test-device-%08d".format(devices.incrementAndGet())
     private val clients = mutableListOf<GameClient>()
 
     @AfterTest
@@ -46,17 +50,17 @@ class GameServerTest {
     fun wifiDirectModeSeventeenthPlayerIsRejected() {
         val s = server(singleLobby = true)
         val (host, hostBot) = client(s)
-        host.send(ClientMessage.Hello(Protocol.VERSION, "host", create = true, arTracking = true))
+        host.send(ClientMessage.Hello(Protocol.VERSION, "host", create = true, arTracking = true, deviceId = dev()))
         hostBot.await<ServerMessage.Welcome>()
         repeat(15) { i ->
             val (c, b) = client(s)
-            c.send(ClientMessage.Hello(Protocol.VERSION, "p$i", arTracking = true))
+            c.send(ClientMessage.Hello(Protocol.VERSION, "p$i", arTracking = true, deviceId = dev()))
             b.await<ServerMessage.Welcome>()
         }
         hostBot.await<ServerMessage.LobbyState> { it.players.size == 16 }
 
         val (late, lateBot) = client(s)
-        late.send(ClientMessage.Hello(Protocol.VERSION, "late", arTracking = true))
+        late.send(ClientMessage.Hello(Protocol.VERSION, "late", arTracking = true, deviceId = dev()))
         val err = lateBot.await<ServerMessage.Error>()
         assertEquals(ErrorCode.LOBBY_FULL, err.code)
         assertEquals(1, s.lobbyCount)
@@ -66,11 +70,11 @@ class GameServerTest {
     fun dedicatedServerHostsSeparateLobbiesByCode() {
         val s = server(singleLobby = false)
         val (a, aBot) = client(s)
-        a.send(ClientMessage.Hello(Protocol.VERSION, "alice", create = true, lobbyName = "Park", arTracking = true))
+        a.send(ClientMessage.Hello(Protocol.VERSION, "alice", create = true, lobbyName = "Park", arTracking = true, deviceId = dev()))
         val code = aBot.await<ServerMessage.Welcome>().lobbyCode
 
         val (b, bBot) = client(s)
-        b.send(ClientMessage.Hello(Protocol.VERSION, "bob", create = true, arTracking = true))
+        b.send(ClientMessage.Hello(Protocol.VERSION, "bob", create = true, arTracking = true, deviceId = dev()))
         val otherCode = bBot.await<ServerMessage.Welcome>().lobbyCode
         assertTrue(code != otherCode)
 
@@ -78,12 +82,12 @@ class GameServerTest {
         c.send(ClientMessage.ListLobbies)
         val list = cBot.await<ServerMessage.LobbyList>()
         assertEquals(setOf(code, otherCode), list.lobbies.map { it.code }.toSet())
-        c.send(ClientMessage.Hello(Protocol.VERSION, "carol", lobbyCode = code.lowercase(), arTracking = true))
+        c.send(ClientMessage.Hello(Protocol.VERSION, "carol", lobbyCode = code.lowercase(), arTracking = true, deviceId = dev()))
         assertNotNull(cBot.await<ServerMessage.Welcome>())
         aBot.await<ServerMessage.LobbyState> { it.players.map { p -> p.name } == listOf("alice", "carol") }
 
         val (d, dBot) = client(s)
-        d.send(ClientMessage.Hello(Protocol.VERSION, "dave", lobbyCode = "ZZZZZ", arTracking = true))
+        d.send(ClientMessage.Hello(Protocol.VERSION, "dave", lobbyCode = "ZZZZZ", arTracking = true, deviceId = dev()))
         assertEquals(ErrorCode.LOBBY_NOT_FOUND, dBot.await<ServerMessage.Error>().code)
     }
 
@@ -91,10 +95,10 @@ class GameServerTest {
     fun fullMatchOverSockets() {
         val s = server(singleLobby = true)
         val (a, aBot) = client(s)
-        a.send(ClientMessage.Hello(Protocol.VERSION, "a", create = true, arTracking = true))
+        a.send(ClientMessage.Hello(Protocol.VERSION, "a", create = true, arTracking = true, deviceId = dev()))
         val aId = aBot.await<ServerMessage.Welcome>().playerId
         val (b, bBot) = client(s)
-        b.send(ClientMessage.Hello(Protocol.VERSION, "b", arTracking = true))
+        b.send(ClientMessage.Hello(Protocol.VERSION, "b", arTracking = true, deviceId = dev()))
         val bId = bBot.await<ServerMessage.Welcome>().playerId
 
         // Both phones are synced to the arena: a at the origin facing west, b 12 m west of it.
@@ -130,10 +134,10 @@ class GameServerTest {
     fun phonesWithoutArAreTurnedAway() {
         val s = server(singleLobby = true)
         val (host, hostBot) = client(s)
-        host.send(ClientMessage.Hello(Protocol.VERSION, "host", create = true, arTracking = true))
+        host.send(ClientMessage.Hello(Protocol.VERSION, "host", create = true, arTracking = true, deviceId = dev()))
         hostBot.await<ServerMessage.Welcome>()
         val (c, bot) = client(s)
-        c.send(ClientMessage.Hello(Protocol.VERSION, "no-ar"))
+        c.send(ClientMessage.Hello(Protocol.VERSION, "no-ar", deviceId = dev()))
         assertEquals(ErrorCode.AR_REQUIRED, bot.await<ServerMessage.Error>().code)
     }
 

@@ -37,7 +37,7 @@ class BystanderTest {
     @Test
     fun lobbyCountsRandomsBroadcastsThemAndPutsThemOnTheScoreboard() {
         var now = 1_000_000L
-        val lobby = Lobby("RANDO", "r") { now }
+        val lobby = Lobby("RANDO", "r", clock = { now })
         val inbox = mutableMapOf<Int, MutableList<ServerMessage>>()
         fun join(n: String) = mutableListOf<ServerMessage>().let { box ->
             (lobby.join(n, arTracking = true) { box += it } as Lobby.JoinResult.Joined).playerId.also { inbox[it] = box }

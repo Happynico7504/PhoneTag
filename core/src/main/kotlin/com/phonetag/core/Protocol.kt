@@ -12,7 +12,7 @@ import kotlinx.serialization.json.Json
  * or on a dedicated machine on the internet, so the client never needs to care which.
  */
 object Protocol {
-    const val VERSION = 6
+    const val VERSION = 7
 
     /** Hard cap on players per lobby. Never configurable above this. */
     const val MAX_PLAYERS_PER_LOBBY = 16
@@ -53,6 +53,8 @@ enum class ErrorCode {
     AR_REQUIRED,
     /** The match can't start until every player is synced to the arena. */
     NOT_SYNCED,
+    /** Cheating was detected from this IP or device; it's locked out for a while. */
+    LOCKED_OUT,
 }
 
 @Serializable
@@ -171,6 +173,8 @@ sealed class ClientMessage {
         val lobbyCode: String? = null,
         val lobbyName: String? = null,
         val arTracking: Boolean = false,
+        /** Stable, hashed per-install device ID; lets the server lock out cheaters across reconnects. */
+        val deviceId: String? = null,
     ) : ClientMessage()
 
     @Serializable @SerialName("list")
@@ -282,6 +286,10 @@ sealed class ServerMessage {
     /** Broadcast when someone is tagged out. */
     @Serializable @SerialName("tag")
     data class Tagged(val shooterId: Int, val victimId: Int) : ServerMessage()
+
+    /** Broadcast when the server removes a player for cheating. */
+    @Serializable @SerialName("kicked")
+    data class PlayerKicked(val playerId: Int, val name: String, val reason: String) : ServerMessage()
 
     /** Broadcast when someone shoots a bystander; [total] is their count this match. */
     @Serializable @SerialName("random")

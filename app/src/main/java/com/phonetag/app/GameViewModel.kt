@@ -11,6 +11,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.phonetag.app.ar.ArEngine
 import com.phonetag.app.ar.ArSupport
+import com.phonetag.app.net.DeviceId
 import com.phonetag.app.net.GroupInfo
 import com.phonetag.app.net.NearbyGame
 import com.phonetag.app.net.WifiDirect
@@ -27,6 +28,7 @@ import com.phonetag.app.vision.PersonDetector
 import com.phonetag.app.voice.VoiceChat
 import com.phonetag.core.ArenaInfo
 import com.phonetag.core.ClientMessage
+import com.phonetag.core.ErrorCode
 import com.phonetag.core.GameClient
 import com.phonetag.core.GameServer
 import com.phonetag.core.GameSettings
@@ -326,6 +328,7 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
             lobbyCode = lobbyCode,
             lobbyName = if (create) "$name's game" else null,
             arTracking = ar.support.value == ArSupport.SUPPORTED,
+            deviceId = DeviceId.get(getApplication()),
         )
     }
 
@@ -488,7 +491,13 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
                 _state.update { it.copy(results = msg) }
             }
             is ServerMessage.Error -> viewModelScope.launch {
-                if (_state.value.myId == 0) fail(msg.message) else _state.update { it.copy(error = msg.message) }
+                // A lockout ends the session; show its message rather than "connection lost".
+                if (_state.value.myId == 0 || msg.code == ErrorCode.LOCKED_OUT) fail(msg.message)
+                else _state.update { it.copy(error = msg.message) }
+            }
+            is ServerMessage.PlayerKicked -> _state.update { s ->
+                val text = "${msg.name} was removed for cheating (${msg.reason})"
+                s.copy(feed = (s.feed + FeedItem(text, now, highlight = true)).takeLast(5))
             }
             is ServerMessage.LobbyList -> _state.update { it.copy(onlineLobbies = msg.lobbies) }
             is ServerMessage.Pong -> Unit

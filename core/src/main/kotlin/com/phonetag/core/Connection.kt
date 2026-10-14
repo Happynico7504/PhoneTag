@@ -37,9 +37,18 @@ class Connection(
         Thread(::writeLoop, "$name-writer").apply { isDaemon = true }.start()
     }
 
+    @Volatile private var closing = false
+
     fun send(line: String) {
-        if (closed.get()) return
+        if (closed.get() || closing) return
         if (!outbox.offer(line)) close()
+    }
+
+    /** Sends one last line (e.g. why we're disconnecting them), then closes once it's written. */
+    fun sendAndClose(line: String) {
+        if (closed.get() || closing) return
+        closing = true
+        if (!outbox.offer(line) || !outbox.offer(POISON)) close()
     }
 
     /**
@@ -47,7 +56,7 @@ class Connection(
      * peer is falling behind, so it can never cause a slow-consumer disconnect.
      */
     fun sendDroppable(line: String) {
-        if (closed.get() || outbox.size > OUTBOX_CAPACITY / 4) return
+        if (closed.get() || closing || outbox.size > OUTBOX_CAPACITY / 4) return
         outbox.offer(line)
     }
 
@@ -80,7 +89,12 @@ class Connection(
                 var line = outbox.poll(1, TimeUnit.SECONDS) ?: if (closed.get()) break else continue
                 // Write everything queued, then flush once.
                 while (true) {
-                    if (line === POISON) return
+                    if (line === POISON) {
+                        // Flush what was queued before the poison (sendAndClose), then hang up.
+                        out.flush()
+                        close()
+                        return
+                    }
                     out.write(line.toByteArray(Charsets.UTF_8))
                     out.write('\n'.code)
                     line = outbox.poll() ?: break

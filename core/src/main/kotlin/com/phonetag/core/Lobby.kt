@@ -16,6 +16,11 @@ class Lobby(
     val code: String,
     val name: String,
     private val clock: () -> Long = System::currentTimeMillis,
+    /**
+     * Reports things only a modified client does (see [Violation]). The server tallies them per
+     * connection and locks persistent offenders out. Called with this lobby's lock held.
+     */
+    private val onViolation: (playerId: Int, Violation) -> Unit = { _, _ -> },
 ) {
     private class Player(
         val id: Int,
@@ -31,6 +36,9 @@ class Lobby(
         var score: Int = 0,
         var deaths: Int = 0,
         var randoms: Int = 0,
+        /** Last arena position, for the speed check (survives gaps without tracking). */
+        var lastArena: ArenaPose? = null,
+        var lastArenaAtMs: Long = 0,
         var beacon: Rigid? = null,
         var beaconAtMs: Long = 0,
     ) {
@@ -92,6 +100,14 @@ class Lobby(
         return JoinResult.Joined(id)
     }
 
+    /** Removes a cheater and tells everyone else why. */
+    @Synchronized
+    fun kick(playerId: Int, reason: String) {
+        val p = players[playerId] ?: return
+        leave(playerId)
+        broadcast(ServerMessage.PlayerKicked(playerId, p.name, reason))
+    }
+
     @Synchronized
     fun leave(playerId: Int) {
         players.remove(playerId) ?: return
@@ -132,12 +148,13 @@ class Lobby(
             }
             is ClientMessage.Ping -> p.sink(ServerMessage.Pong(msg.clientTimeMs))
             is ClientMessage.Voice -> {
-                if (msg.data.length > Protocol.MAX_VOICE_CHARS) return
+                if (msg.data.length > Protocol.MAX_VOICE_CHARS) return onViolation(p.id, Violation.BAD_DATA)
                 val frame = ServerMessage.Voice(p.id, msg.seq, msg.data)
                 for (q in players.values) if (q.id != p.id && radio.canHear(p.id, q.id)) q.sink(frame)
             }
             is ClientMessage.SetBeacon -> {
                 val screen = msg.screen
+                if (screen != null && !screen.isFinite()) onViolation(p.id, Violation.BAD_DATA)
                 if (screen == null || msg.epoch != arena.epoch || !screen.isFinite()) {
                     p.beacon = null
                 } else {
@@ -236,15 +253,36 @@ class Lobby(
     }
 
     private fun updatePose(p: Player, pose: Pose) {
-        if (!pose.isPlausible()) return
+        if (!pose.isPlausible()) return onViolation(p.id, Violation.BAD_DATA)
+        val now = clock()
         // Arena poses from an older (reset) arena epoch are meaningless now.
         val arenaPose = pose.arena
-        p.pose = if (arenaPose != null && (arenaPose.epoch != arena.epoch || !arenaPose.position.isFinite() || !arenaPose.forward.isFinite())) {
-            pose.copy(arena = null)
-        } else {
-            pose
+        val valid = arenaPose != null && arenaPose.epoch == arena.epoch && arenaPose.position.isFinite() && arenaPose.forward.isFinite()
+        p.pose = if (arenaPose != null && !valid) pose.copy(arena = null) else pose
+        p.poseAtMs = now
+        if (valid && arenaPose != null) {
+            checkMovement(p, arenaPose, now)
+            p.lastArena = arenaPose
+            p.lastArenaAtMs = now
         }
-        p.poseAtMs = clock()
+    }
+
+    /**
+     * Speed / teleport check on precise arena positions (GPS is far too jumpy to judge). Small
+     * moves are ignored so network bunching of pose updates can't look like speed, and the
+     * teleport check only covers short gaps (a player who lost tracking may legitimately walk far).
+     */
+    private fun checkMovement(p: Player, pose: ArenaPose, now: Long) {
+        val last = p.lastArena ?: return
+        if (last.epoch != pose.epoch) return
+        val dt = now - p.lastArenaAtMs
+        if (dt <= 0) return
+        val v = pose.position - last.position
+        val d = kotlin.math.sqrt(v.x * v.x + v.z * v.z)
+        when {
+            d > TELEPORT_M && dt < TELEPORT_WINDOW_MS -> onViolation(p.id, Violation.TELEPORT)
+            d > MIN_SPEED_CHECK_M && d / (dt / 1000.0) > MAX_SPEED_MPS -> onViolation(p.id, Violation.SPEED)
+        }
     }
 
     private fun startMatch() {
@@ -282,13 +320,21 @@ class Lobby(
     private fun shoot(shooter: Player, msg: ClientMessage.Shoot) {
         if (phase != Phase.RUNNING || !shooter.alive) return
         val now = clock()
-        if (now - shooter.lastShotAtMs < settings.fireCooldownMs) return
-        if (!msg.pose.isPlausible()) return
+        val sinceLast = now - shooter.lastShotAtMs
+        if (sinceLast < settings.fireCooldownMs) {
+            // The app never fires faster than the cooldown; well under it is a modified client
+            // (half the cooldown leaves room for network jitter bunching two honest shots).
+            if (sinceLast < settings.fireCooldownMs / 2) onViolation(shooter.id, Violation.FIRE_RATE)
+            return
+        }
+        if (!msg.pose.isPlausible()) return onViolation(shooter.id, Violation.BAD_DATA)
         shooter.lastShotAtMs = now
         // The shot carries the freshest fix of the shooter; use it as their pose too.
         updatePose(shooter, msg.pose)
         if (shooter.pose?.arena == null) {
-            // Fairness: everyone shoots with precise camera tracking or not at all.
+            // Fairness: everyone shoots with precise camera tracking or not at all. The app disables
+            // its fire button without tracking, so this mostly comes from modified clients.
+            onViolation(shooter.id, Violation.UNTRACKED_SHOT)
             shooter.sink(ServerMessage.ShotResult(msg.seq, null, null, false, untracked = true))
             return
         }
@@ -390,6 +436,12 @@ class Lobby(
         /** Targets whose last fix is older than this can't be hit (they may have moved anywhere). */
         const val STALE_POSE_MS = 3_000L
         const val STALE_BEACON_MS = 1_500L
+
+        /** Faster than a sprinting human, sustained between two pose updates. */
+        const val MAX_SPEED_MPS = 12.0
+        const val MIN_SPEED_CHECK_M = 3.0
+        const val TELEPORT_M = 30.0
+        const val TELEPORT_WINDOW_MS = 2_000L
         const val MAX_WALLS_PER_PLAYER = 32
         const val MAX_WALLS_TOTAL = 192
         const val WALLS_BROADCAST_INTERVAL_MS = 2_000L
