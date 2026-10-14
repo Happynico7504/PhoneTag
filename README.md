@@ -226,6 +226,35 @@ docker build -f server/Dockerfile -t phonetag-server .
 docker run -p 47474:47474 phonetag-server
 ```
 
+### Updating a running server
+`server/update.sh` pulls the latest code, builds the server and swaps it into a running instance
+without recreating anything. Afterwards it checks that the server came back up, and if not it
+automatically rolls back to the previous version.
+
+```bash
+server/update.sh --docker phonetag                    # Docker: update the container named "phonetag"
+server/update.sh --docker phonetag --rebuild-image phonetag-server   # ...and keep the image in sync
+sudo server/update.sh --native /opt/phonetag-server   # native install (+ restarts the systemd service)
+server/update.sh                                      # auto-detect: container "phonetag", else /opt/phonetag-server
+server/update.sh --rollback --docker phonetag         # go back to the version before the last update
+```
+
+- **Build:** uses your JDK if it's 17 or newer, otherwise builds inside a throwaway
+  `gradle:8.14.3-jdk17` container, so the host needs neither Java nor the Android SDK. Under
+  `sudo` it still builds as your own user.
+- **Docker:** backs up the container's `/opt/phonetag-server`, kept in
+  `~/.local/state/phonetag/` for `--rollback`, copies the new build in with `docker cp`,
+  restarts the container and waits for the "listening" log line. The container keeps its
+  name, ports and settings. Without `--rebuild-image`, recreating the container later from
+  the old image brings the old version back.
+- **Native:** stages the build next to the install, swaps the directories in one step, keeping
+  the previous one as `DIR.old` for `--rollback`, and restarts the systemd service
+  (`--service NAME`, default `phonetag-server`). It then waits until the port answers. Without
+  a service it just installs and tells you to restart the process. `server/phonetag-server.service`
+  is a ready-made, hardened systemd unit with install steps.
+- **Restarting drops current lobbies**, because they only live in memory. The script prints the
+  protocol version the new server speaks, so you know which app build players need.
+
 Open TCP port 47474 in your firewall. In the app, go to **Play online**, choose **Custom server**
 and enter `host:47474`. Then either create a lobby and share its 5-letter code, or join from the
 open-lobby list.
