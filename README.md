@@ -234,6 +234,11 @@ The **Official server** choice, selected by default, connects to the public inst
 `phonetag.nicochristmann.net:47474` without typing anything. Your custom address is kept
 separately, so you can switch back and forth.
 
+**Favorites:** with a custom address entered, tap **☆ Save** to store it under a name. Saved
+servers appear as a list in the online menu: tap one to switch to it and load its lobbies, or
+tap ✕ to remove it. Favorites live on the phone, newest first, up to 20. The same server
+written differently, like `Host` vs `host:47474`, is only saved once.
+
 ## Playing
 
 1. Everyone installs the APK on an ARCore-supported phone and grants camera, location and nearby-devices permissions.

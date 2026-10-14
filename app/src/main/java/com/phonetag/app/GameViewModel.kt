@@ -19,6 +19,8 @@ import com.phonetag.app.light.TorchController
 import com.phonetag.app.sensors.LightSensor
 import com.phonetag.app.sensors.LocationTracker
 import com.phonetag.app.sensors.OrientationTracker
+import com.phonetag.app.servers.FavoriteServer
+import com.phonetag.app.servers.FavoriteServers
 import com.phonetag.app.sfx.Sfx
 import com.phonetag.app.sfx.SoundFx
 import com.phonetag.app.vision.PersonDetector
@@ -83,6 +85,8 @@ data class UiState(
     val serverAddress: String = "",
     /** Online play goes to the official PhoneTag server instead of [serverAddress]. */
     val useOfficialServer: Boolean = true,
+    /** Servers the player saved, newest first. */
+    val favorites: List<FavoriteServer> = emptyList(),
     val status: String? = null,
     val error: String? = null,
     val transport: Transport? = null,
@@ -129,6 +133,7 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
             playerName = prefs.getString("name", null) ?: Build.MODEL.take(16),
             serverAddress = prefs.getString("server", "") ?: "",
             useOfficialServer = prefs.getBoolean("official", true),
+            favorites = FavoriteServers.decode(prefs.getString("favorites", null)),
             soundOn = prefs.getBoolean("sound", true),
             micOn = prefs.getBoolean("mic", true),
         )
@@ -232,6 +237,26 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
         prefs.edit().putBoolean("official", official).apply()
         _state.update { it.copy(useOfficialServer = official, onlineLobbies = emptyList()) }
         if (official) refreshOnlineLobbies()
+    }
+
+    // ------------------------------------------------------------------ favorite servers
+
+    /** Saves the current custom address under [name] (blank = use the host name). */
+    fun saveFavorite(name: String) = updateFavorites { FavoriteServers.add(it, name, _state.value.serverAddress) }
+
+    fun removeFavorite(address: String) = updateFavorites { FavoriteServers.remove(it, address) }
+
+    /** Switches online play to a saved server and lists its lobbies. */
+    fun selectFavorite(server: FavoriteServer) {
+        setServerAddress(server.address)
+        useOfficialServer(false)
+        refreshOnlineLobbies()
+    }
+
+    private fun updateFavorites(change: (List<FavoriteServer>) -> List<FavoriteServer>) {
+        val updated = change(_state.value.favorites)
+        prefs.edit().putString("favorites", FavoriteServers.encode(updated)).apply()
+        _state.update { it.copy(favorites = updated) }
     }
 
     /** Address online play currently targets, or null if a custom server is selected but not entered. */
@@ -634,6 +659,7 @@ class GameViewModel(app: Application) : AndroidViewModel(app) {
         _state.update {
             UiState(
                 playerName = it.playerName, serverAddress = it.serverAddress, useOfficialServer = it.useOfficialServer,
+                favorites = it.favorites,
                 error = it.error, soundOn = it.soundOn,
                 torchMode = it.torchMode, micOn = it.micOn, micAllowed = it.micAllowed,
             )

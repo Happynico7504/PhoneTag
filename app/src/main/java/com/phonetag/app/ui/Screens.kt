@@ -2,6 +2,8 @@ package com.phonetag.app.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -54,6 +56,7 @@ import com.phonetag.app.Screen
 import com.phonetag.app.Transport
 import com.phonetag.app.ar.ArCameraView
 import com.phonetag.app.ar.ArSupport
+import com.phonetag.app.servers.FavoriteServers
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.ui.draw.clip
@@ -242,15 +245,51 @@ private fun OnlineScreen(vm: GameViewModel, state: UiState) {
             )
         }
         if (!official) {
-            OutlinedTextField(
-                value = state.serverAddress,
-                onValueChange = vm::setServerAddress,
-                label = { Text("Custom server (host:port)") },
-                placeholder = { Text("play.example.com:${Protocol.DEFAULT_PORT}") },
-                singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-                modifier = Modifier.fillMaxWidth(),
+            val current = FavoriteServers.normalize(state.serverAddress)
+            val saved = current != null && state.favorites.any { it.address == current }
+            var naming by rememberSaveable { mutableStateOf(false) }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                OutlinedTextField(
+                    value = state.serverAddress,
+                    onValueChange = vm::setServerAddress,
+                    label = { Text("Custom server (host:port)") },
+                    placeholder = { Text("play.example.com:${Protocol.DEFAULT_PORT}") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                    modifier = Modifier.weight(1f),
+                )
+                Spacer(Modifier.width(8.dp))
+                OutlinedButton(onClick = { naming = true }, enabled = current != null && !saved) {
+                    Text(if (saved) "★ Saved" else "☆ Save")
+                }
+            }
+            if (naming) SaveFavoriteDialog(
+                defaultName = current?.substringBefore(':').orEmpty(),
+                onSave = { vm.saveFavorite(it); naming = false },
+                onDismiss = { naming = false },
             )
+        }
+        if (state.favorites.isNotEmpty()) {
+            Text("Favorites", style = MaterialTheme.typography.titleMedium)
+            // Bounded and scrollable so a long list never pushes the lobby list off screen.
+            Column(Modifier.heightIn(max = 190.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                for (fav in state.favorites) {
+                    val selected = !official && FavoriteServers.normalize(state.serverAddress) == fav.address
+                    Row(
+                        Modifier.fillMaxWidth()
+                            .background(if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.15f) else Color(0x14FFFFFF), RoundedCornerShape(10.dp))
+                            .clickable { vm.selectFavorite(fav) }
+                            .padding(start = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(Modifier.weight(1f).padding(vertical = 8.dp)) {
+                            Text("★ ${fav.name}", fontWeight = FontWeight.Bold)
+                            Text(fav.address, color = Color.Gray, fontSize = 12.sp)
+                        }
+                        TextButton(onClick = { vm.removeFavorite(fav.address) }) { Text("✕", color = Color.Gray) }
+                    }
+                }
+            }
         }
         Button(onClick = vm::createOnline, enabled = serverReady, modifier = Modifier.fillMaxWidth()) {
             Text("Create new lobby")
@@ -287,6 +326,20 @@ private fun OnlineScreen(vm: GameViewModel, state: UiState) {
             }
         }
     }
+}
+
+@Composable
+private fun SaveFavoriteDialog(defaultName: String, onSave: (String) -> Unit, onDismiss: () -> Unit) {
+    var name by rememberSaveable { mutableStateOf(defaultName) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Save server") },
+        text = {
+            OutlinedTextField(value = name, onValueChange = { name = it.take(32) }, label = { Text("Name") }, singleLine = true)
+        },
+        confirmButton = { TextButton(onClick = { onSave(name) }) { Text("Save") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
 
 @Composable
