@@ -59,7 +59,10 @@ class GameServer(
         isRunning = false
         ticker?.shutdownNow()
         runCatching { serverSocket?.close() }
-        connections.toList().forEach { it.close() }
+        // Iterate the concurrent set directly: closing removes entries, which its iterator tolerates.
+        // (toList() races: it reads size() and then iterator().next(), which throws if the last
+        // connection closed in between.)
+        for (c in connections) c.close()
         lobbies.clear()
     }
 
